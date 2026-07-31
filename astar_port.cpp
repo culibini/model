@@ -80,6 +80,10 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 // =============================================================================
 //  config.py
 // =============================================================================
@@ -165,27 +169,71 @@ static inline double hypot2(double dx, double dy) {
 //              честно memset-ит гигабайты)
 //   uninit() — malloc без инициализации (это np.empty)
 //   filled() — malloc + fill (это np.full)
+// Большие буферы берутся через mmap, а не malloc, по трём причинам:
+//   * страницы нулевые и выдаются лениво (как np.zeros, без физического memset);
+//   * адрес выровнен по странице, значит к нему применим madvise;
+//   * MADV_HUGEPAGE переводит буфер на страницы по 2 МБ. При рабочем наборе в
+//     сотни мегабайт это решающе: с обычными страницами по 4 КБ таблица
+//     трансляции не влезает в TLB (полторы тысячи записей против сотен тысяч
+//     нужных), и почти каждое случайное обращение платит лишний поход в память
+//     ещё до чтения самих данных.
 template <typename T>
 struct Buf {
     T* p = nullptr;
     size_t n = 0;
+    size_t map_bytes = 0;             // != 0 => выделено через mmap
+
+    static constexpr size_t BIG_THRESHOLD = 8u << 20;
 
     Buf() = default;
     Buf(const Buf&) = delete;
     Buf& operator=(const Buf&) = delete;
-    ~Buf() { std::free(p); }
+    ~Buf() { release(); }
 
-    void release() { std::free(p); p = nullptr; n = 0; }
+    void release() {
+#ifdef __linux__
+        if (map_bytes) {
+            ::munmap((void*)p, map_bytes);
+            p = nullptr; n = 0; map_bytes = 0;
+            return;
+        }
+#endif
+        std::free(p);
+        p = nullptr; n = 0;
+    }
+
+    bool map_big(size_t bytes) {
+#ifdef __linux__
+        const size_t HP = (size_t)1 << 21;             // 2 МБ
+        const size_t rounded = (bytes + HP - 1) / HP * HP;
+        void* q = ::mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (q == MAP_FAILED) return false;
+#if defined(MADV_HUGEPAGE) && !defined(ASTAR_NO_HUGEPAGE)
+        ::madvise(q, rounded, MADV_HUGEPAGE);
+#endif
+        p = (T*)q;
+        map_bytes = rounded;
+        return true;
+#else
+        (void)bytes;
+        return false;
+#endif
+    }
 
     void zeros(size_t count) {
         release();
+        const size_t bytes = (count ? count : 1) * sizeof(T);
+        if (bytes >= BIG_THRESHOLD && map_big(bytes)) { n = count; return; }
         p = (T*)std::calloc(count ? count : 1, sizeof(T));
         if (!p) throw std::bad_alloc();
         n = count;
     }
     void uninit(size_t count) {
         release();
-        p = (T*)std::malloc((count ? count : 1) * sizeof(T));
+        const size_t bytes = (count ? count : 1) * sizeof(T);
+        if (bytes >= BIG_THRESHOLD && map_big(bytes)) { n = count; return; }
+        p = (T*)std::malloc(bytes);
         if (!p) throw std::bad_alloc();
         n = count;
     }
@@ -1023,65 +1071,74 @@ struct Environment {
 //  dijkstra.py — двоичная куча (тот же массивный вариант, что в numba)
 // =============================================================================
 
+// Гибридная раскладка кучи. Приоритеты — отдельным плотным массивом: при
+// просеивании сравниваются именно они, и когда они лежат подряд, дети
+// (2i+1, 2i+2) почти всегда в одной кэшлинии, а верхушка кучи целиком сидит
+// в L1/L2. Остальная нагрузка (cost, x, y, level, hour) упакована в одну
+// 24-байтовую структуру: при обмене трогаем два места в памяти, а не шесть,
+// как в исходных параллельных массивах numba. Порядок сравнений и обменов
+// прежний — куча ведёт себя идентично исходной.
+struct HeapPayload {
+    double  cost;
+    int32_t x, y, level, hour;
+};
+
+struct HeapNode {   // то, что возвращает pop()
+    double  priority;
+    double  cost;
+    int32_t x, y, level, hour;
+};
+
 struct Heap {
-    Buf<double>  priorities, costs;
-    Buf<int32_t> xs, ys, levels, hours;
+    Buf<double>      pri;
+    Buf<HeapPayload> pay;
     long long size = 0, capacity = 0;
 
     // np.empty — без инициализации
     void init(long long cap) {
         capacity = cap;
-        priorities.uninit((size_t)cap);
-        costs.uninit((size_t)cap);
-        xs.uninit((size_t)cap);
-        ys.uninit((size_t)cap);
-        levels.uninit((size_t)cap);
-        hours.uninit((size_t)cap);
+        pri.uninit((size_t)cap);
+        pay.uninit((size_t)cap);
         size = 0;
     }
 
     void push(double priority, double cost, int32_t x, int32_t y, int32_t level, int32_t hour) {
+        double*      __restrict p  = pri.data();
+        HeapPayload* __restrict pl = pay.data();
         long long idx = size;
-        priorities[idx] = priority;
-        costs[idx] = cost;
-        xs[idx] = x; ys[idx] = y; levels[idx] = level; hours[idx] = hour;
+        p[idx]  = priority;
+        pl[idx] = HeapPayload{cost, x, y, level, hour};
         while (idx > 0) {
-            long long parent = (idx - 1) / 2;
-            if (priorities[parent] <= priorities[idx]) break;
-            std::swap(priorities[parent], priorities[idx]);
-            std::swap(costs[parent], costs[idx]);
-            std::swap(xs[parent], xs[idx]);
-            std::swap(ys[parent], ys[idx]);
-            std::swap(levels[parent], levels[idx]);
-            std::swap(hours[parent], hours[idx]);
+            const long long parent = (idx - 1) / 2;
+            if (p[parent] <= p[idx]) break;
+            std::swap(p[parent], p[idx]);
+            std::swap(pl[parent], pl[idx]);
             idx = parent;
         }
         size += 1;
     }
 
-    void pop(double& top_p, double& top_c, int32_t& top_x, int32_t& top_y,
-             int32_t& top_l, int32_t& top_h) {
-        if (size == 0) { top_p = 0; top_c = 0; top_x = 0; top_y = 0; top_l = 0; top_h = 0; return; }
-        top_p = priorities[0]; top_c = costs[0];
-        top_x = xs[0]; top_y = ys[0]; top_l = levels[0]; top_h = hours[0];
+    HeapNode pop() {
+        double*      __restrict p  = pri.data();
+        HeapPayload* __restrict pl = pay.data();
+        if (size == 0) return HeapNode{0.0, 0.0, 0, 0, 0, 0};
+        const double      top_p  = p[0];
+        const HeapPayload top_pl = pl[0];
         size -= 1;
-        priorities[0] = priorities[size];
-        costs[0] = costs[size];
-        xs[0] = xs[size]; ys[0] = ys[size]; levels[0] = levels[size]; hours[0] = hours[size];
+        p[0]  = p[size];
+        pl[0] = pl[size];
         long long idx = 0;
         while (true) {
-            long long left = 2 * idx + 1, right = 2 * idx + 2, smallest = idx;
-            if (left < size && priorities[left] < priorities[smallest]) smallest = left;
-            if (right < size && priorities[right] < priorities[smallest]) smallest = right;
+            const long long left = 2 * idx + 1, right = 2 * idx + 2;
+            long long smallest = idx;
+            if (left  < size && p[left]  < p[smallest]) smallest = left;
+            if (right < size && p[right] < p[smallest]) smallest = right;
             if (smallest == idx) break;
-            std::swap(priorities[idx], priorities[smallest]);
-            std::swap(costs[idx], costs[smallest]);
-            std::swap(xs[idx], xs[smallest]);
-            std::swap(ys[idx], ys[smallest]);
-            std::swap(levels[idx], levels[smallest]);
-            std::swap(hours[idx], hours[smallest]);
+            std::swap(p[idx], p[smallest]);
+            std::swap(pl[idx], pl[smallest]);
             idx = smallest;
         }
+        return HeapNode{top_p, top_pl.cost, top_pl.x, top_pl.y, top_pl.level, top_pl.hour};
     }
 };
 
@@ -1219,12 +1276,24 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     }
 
     const double inf = 1e18;
-    Buf<double>  dist_grid;       dist_grid.filled(N4, inf);
-    Buf<double>  stay_grid;       stay_grid.zeros(N4);
-    Buf<double>  hour_stay_grid;  hour_stay_grid.zeros(N4);
-    Buf<double>  total_dist_grid; total_dist_grid.zeros(N4);
-    Buf<int32_t> prev_grid;       prev_grid.filled(N4 * 4, -1);
-    Buf<uint8_t> visited;         visited.zeros(N4);
+
+    // dist_grid держим отдельно: он читается на КАЖДОЙ попытке релаксации,
+    // а три поля ниже — только на удачных и при извлечении узла. Слив их в
+    // одну структуру, мы бы тянули 32 байта там, где нужно 8.
+    Buf<double> dist_grid; dist_grid.filled(N4, inf);
+
+    // Эти три всегда пишутся вместе и читаются вместе -> одна кэшлиния
+    // вместо трёх. Нули в StateAux — это нулевые биты, т.е. ровно 0.0.
+    struct StateAux { double stay, hour_stay, total_dist; };
+    Buf<StateAux> aux; aux.zeros(N4);
+
+    // Предок — это одно состояние из N4, а N4 помещается в uint32 даже на
+    // карте 20000x20000. Вместо четырёх int32 (gy, gx, level, hour) храним
+    // один плоский индекс: 16 байт на состояние -> 4.
+    constexpr uint32_t NO_PREV = 0xFFFFFFFFu;
+    Buf<uint32_t> prev_state; prev_state.filled(N4, NO_PREV);
+
+    Buf<uint8_t> visited; visited.zeros(N4);
 
     const long long max_heap_nodes = (long long)N4;
     const long long heap_capacity = std::min(max_nodes, max_heap_nodes) + 10;
@@ -1247,12 +1316,13 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     int gs_gx = start_gx, gs_gy = start_gy, gs_l = start_level, gs_h = start_hour;
 
     while (heap.size > 0 && nodes_processed < max_nodes) {
-        double prio, cur_cost;
-        int32_t gx, gy, level, hour_idx;
-        heap.pop(prio, cur_cost, gx, gy, level, hour_idx);
+        const HeapNode top = heap.pop();
+        const double cur_cost = top.cost;
+        const int32_t gx = top.x, gy = top.y, level = top.level, hour_idx = top.hour;
 
-        if (visited[IDX(gy, gx, level, hour_idx)]) continue;
-        visited[IDX(gy, gx, level, hour_idx)] = 1;
+        const size_t cur_ni = IDX(gy, gx, level, hour_idx);
+        if (visited[cur_ni]) continue;
+        visited[cur_ni] = 1;
         nodes_processed++;
 
         const double real_x = (double)gx * step_size;
@@ -1266,19 +1336,45 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             break;
         }
 
-        const double current_total_distance = total_dist_grid[IDX(gy, gx, level, hour_idx)];
-        const double current_stay           = stay_grid[IDX(gy, gx, level, hour_idx)];
-        const double current_hour_stay      = hour_stay_grid[IDX(gy, gx, level, hour_idx)];
+        const StateAux cur_aux = aux[cur_ni];             // одна кэшлиния на три поля
+        const double current_total_distance = cur_aux.total_dist;
+        const double current_stay           = cur_aux.stay;
+        const double current_hour_stay      = cur_aux.hour_stay;
 
+        // Сначала отбираем допустимых соседей и запускаем предвыборку их блоков:
+        // пока считается первое направление, память уже тянет остальные.
+        // Порядок обхода сохраняется, поэтому результат не меняется.
+        int nb_cnt = 0;
+        int    nb_dir[8];
+        size_t nb_block[8];
         for (int d = 0; d < 8; ++d) {
             const int ngx = gx + directions[d].dx;
             const int ngy = gy + directions[d].dy;
             if (ngx < 0 || ngy < 0 || ngx >= grid_w || ngy >= grid_h) continue;
-
             const int nx_real = ngx * step_size;
             const int ny_real = ngy * step_size;
             if (nx_real < 0 || ny_real < 0 || nx_real >= width || ny_real >= height) continue;
             if (!validity_cache.at(ny_real, nx_real)) continue;
+            nb_dir[nb_cnt] = d;
+            nb_block[nb_cnt] = ((size_t)ngy * grid_w + ngx) * BLOCK;
+            nb_cnt++;
+        }
+#ifndef ASTAR_NO_PREFETCH
+        // Обращения идут не по базе блока, а вокруг текущего эшелона:
+        // смещение level*max_hours. Тянуть надо именно его.
+        {
+            const size_t centre = (size_t)level * max_hours;
+            for (int k = 0; k < nb_cnt; ++k) {
+                __builtin_prefetch(dist_grid.data()   + nb_block[k] + centre, 0, 1);
+                __builtin_prefetch(danger_grid.data() + nb_block[k] + centre, 0, 1);
+            }
+        }
+#endif
+
+        for (int k = 0; k < nb_cnt; ++k) {
+            const int d = nb_dir[k];
+            const int ngx = gx + directions[d].dx;
+            const int ngy = gy + directions[d].dy;
 
             const double step_distance = directions[d].mul * step_size;
 
@@ -1291,7 +1387,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
             // База блока клетки-назначения: дальше индексируем как
             // [next_level * max_hours + target_hour] — сплошной кусок памяти.
-            const size_t nblock = (((size_t)ngy * grid_w + ngx)) * BLOCK;
+            const size_t nblock = nb_block[k];
             const double* __restrict dg_blk = danger_grid.data() + nblock;
             const double* __restrict mn_blk = min_nb_danger.data() + nblock;
 
@@ -1379,11 +1475,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     const size_t ni = nblock + lvl_off + target_hour;
                     if (new_cost < dist_grid[ni]) {
                         dist_grid[ni] = new_cost;
-                        stay_grid[ni] = new_stay;
-                        hour_stay_grid[ni] = new_hour_stay;
-                        total_dist_grid[ni] = new_total_distance;
-                        int32_t* __restrict pv = prev_grid.data() + ni * 4;
-                        pv[0] = gy; pv[1] = gx; pv[2] = level; pv[3] = hour_idx;
+                        aux[ni] = StateAux{new_stay, new_hour_stay, new_total_distance};
+                        prev_state[ni] = (uint32_t)cur_ni;
 
                         if (heap.size < heap.capacity)
                             heap.push(new_cost + heuristic * 0.1, new_cost,
@@ -1437,24 +1530,29 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     if (!goal_found) { out.ok = false; return out; }
 
     // ---- восстановление пути ----
+    // Идём по плоским индексам предков; (gy, gx, level, hour) раскладываются
+    // обратно арифметикой, обратной IDX().
     std::vector<double> ppx, ppy, pstay, pdist;
     std::vector<int> plvl, parr;
 
-    int gx = gs_gx, gy = gs_gy, lvl = gs_l, hr = gs_h;
-    while (gx != -1 && gy != -1 && lvl != -1 && hr != -1) {
+    size_t cur = IDX(gs_gy, gs_gx, gs_l, gs_h);
+    while (true) {
+        const int hr   = (int)(cur % (size_t)max_hours);
+        const int lvl  = (int)((cur / max_hours) % (size_t)num_levels);
+        const size_t c = cur / ((size_t)max_hours * num_levels);
+        const int gx   = (int)(c % (size_t)grid_w);
+        const int gy   = (int)(c / (size_t)grid_w);
+
         ppx.push_back((double)gx * step_size);
         ppy.push_back((double)gy * step_size);
         plvl.push_back(lvl);
-        pstay.push_back(stay_grid[IDX(gy, gx, lvl, hr)]);
-        pdist.push_back(total_dist_grid[IDX(gy, gx, lvl, hr)]);
+        pstay.push_back(aux[cur].stay);
+        pdist.push_back(aux[cur].total_dist);
         parr.push_back(hr);
 
-        const size_t ni = IDX(gy, gx, lvl, hr);
-        const int py_ = prev_grid[ni * 4 + 0];
-        const int px_ = prev_grid[ni * 4 + 1];
-        const int pl_ = prev_grid[ni * 4 + 2];
-        const int ph_ = prev_grid[ni * 4 + 3];
-        gx = px_; gy = py_; lvl = pl_; hr = ph_;
+        const uint32_t pr = prev_state[cur];
+        if (pr == NO_PREV) break;      // дошли до стартового узла
+        cur = pr;
     }
 
     std::reverse(ppx.begin(), ppx.end());
@@ -2494,8 +2592,9 @@ int main(int argc, char** argv) {
 
     Timer wall;
 
-    // ---- маршрут по умолчанию — как в tests/test_calc_and_vis.py, в (y, x) ----
+    // ---- маршрут по умолчанию, в (y, x) ----
     std::vector<std::pair<double, double>> route_points = {
+        {2000.0, 8000.0},
         {3000.0, 3850.0},
         {1500.0, 1500.0},
     };
