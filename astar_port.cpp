@@ -2542,6 +2542,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Таймер расчёта останавливается здесь: всё, что ниже (печать маршрута,
+    // рисование и запись cpp_test.png), в замер не входит.
+    const double compute_time = wall.sec();
+
     // печать результата (аналог print(result) в питоне): (y, x, level)
     std::cout << "\nМаршрут (" << result.size() << " точек), формат (y, x, level):\n[";
     for (size_t i = 0; i < result.size(); ++i) {
@@ -2556,12 +2560,15 @@ int main(int argc, char** argv) {
     const double goal_x  = route_points.back().second;
     const double goal_y  = route_points.back().first;
 
+    Timer vis_timer;
     visualize(env->raw_map, result, start_x, start_y, goal_x, goal_y, "cpp_test.png");
+    const double visualize_time = vis_timer.sec();
 
     delete env;
 
     std::cout << "\n=============================================\n";
-    std::cout << "Время выполнения: " << wall.sec() << " c\n";
+    std::cout << "Время выполнения: " << compute_time << " c\n";
+    std::cout << "  (визуализация, не входит в замер: " << visualize_time << " c)\n";
     std::cout << "=============================================\n";
     return 0;
 }
