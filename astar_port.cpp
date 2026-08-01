@@ -487,17 +487,16 @@ struct NumpyRandom {
 
 static NumpyRandom g_rng;
 
-static inline void map_to_3d_coords(double x, double y, double scale_x, double scale_y,
-                                    int max_x3d, int max_y3d, int& x3d, int& y3d) {
-    long xi = py_trunc_i(x / scale_x);
-    long yi = py_trunc_i(y / scale_y);
-    if (xi < 0) xi = 0;
-    if (yi < 0) yi = 0;
-    if (xi > max_x3d) xi = max_x3d;
-    if (yi > max_y3d) yi = max_y3d;
-    x3d = (int)xi;
-    y3d = (int)yi;
+static inline double hyperbolic_danger(double v) {
+    if (cfg::DANGER_HYPERBOLIC_RANGE <= 0.0) return v;
+    const double delta = v - cfg::DANGER_SOFT_LIMIT;
+    if (delta <= 0.0) return v;
+    const double cap = cfg::DANGER_HYPERBOLIC_RANGE * 0.999999;
+    const double capped = std::min(delta, cap);
+    const double denom  = std::max(1e-6, cfg::DANGER_HYPERBOLIC_RANGE - capped);
+    return v + cfg::DANGER_HYPERBOLIC_SCALE * (capped / denom);
 }
+
 
 struct Grid2D {
     int width = 0, height = 0;
@@ -601,8 +600,8 @@ static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
         double sum_x = 0.0, sum_y = 0.0;
 
         for (int j = window_start; j <= window_end; ++j) {
-            sum_x += path_xs[j];
-            sum_y += path_ys[j];
+            sum_x += adj_xs[j];
+            sum_y += adj_ys[j];
             count++;
         }
 
@@ -797,11 +796,31 @@ struct Array3D {
     }
 };
 
+static double sample3d(const Array3D& a, int level, double px, double py,
+                       double scale_x, double scale_y) {
+    if (level < 0 || level >= a.levels) return 0.0;
+    double u = px / scale_x - 0.5;
+    double v = py / scale_y - 0.5;
+    if (u < 0.0) u = 0.0;
+    if (v < 0.0) v = 0.0;
+    const double mu = (double)a.width - 1.0;
+    const double mv = (double)a.height - 1.0;
+    if (u > mu) u = mu;
+    if (v > mv) v = mv;
+    const int x0 = (int)u, y0 = (int)v;
+    const int x1 = std::min(x0 + 1, a.width - 1);
+    const int y1 = std::min(y0 + 1, a.height - 1);
+    const double fu = u - x0, fv = v - y0;
+    const double d00 = a.at(level, y0, x0), d10 = a.at(level, y0, x1);
+    const double d01 = a.at(level, y1, x0), d11 = a.at(level, y1, x1);
+    return (d00 * (1.0 - fu) + d10 * fu) * (1.0 - fv) +
+           (d01 * (1.0 - fu) + d11 * fu) * fv;
+}
+
 struct DangerValueCache {
     const DangerMapCache* map_cache = nullptr;
     const std::vector<Array3D>* arrays_3d = nullptr;
     double scale_x = 1.0, scale_y = 1.0, flight_speed = cfg::FLIGHT_SPEED;
-    int max_x3d = 0, max_y3d = 0;
 
     FlatDangerMap cache;
     std::vector<uint64_t> insertion_order;
@@ -810,13 +829,6 @@ struct DangerValueCache {
     DangerValueCache(const DangerMapCache* mc, const std::vector<Array3D>* a3d,
                      double sx, double sy, double fs)
         : map_cache(mc), arrays_3d(a3d), scale_x(sx), scale_y(sy), flight_speed(fs) {
-        if (!a3d->empty()) {
-            max_y3d = (*a3d)[0].height - 1;
-            max_x3d = (*a3d)[0].width - 1;
-        } else {
-            max_y3d = 0;
-            max_x3d = 0;
-        }
     }
 
     static inline uint64_t make_key(long x, long y, int level, int hour) {
@@ -833,8 +845,8 @@ struct DangerValueCache {
     std::pair<double, int> get_total_danger_cached(double px, double py, int level,
                                                    double distance_traveled) {
 
-        long x = py_trunc_i(px);
-        long y = py_trunc_i(py);
+        long x = py_round_i(px);
+        long y = py_round_i(py);
         int hour_idx = (int)distance_to_hour_index(distance_traveled,
                                                    (double)arrays_3d->size(), flight_speed);
         uint64_t key = make_key(x, y, level, hour_idx);
@@ -845,14 +857,9 @@ struct DangerValueCache {
         double base_danger = map_cache->get_cached_danger(px, py);
         double level_penalty = get_level_penalty_cached(level);
 
-        int x3d, y3d;
-        map_to_3d_coords(px, py, scale_x, scale_y, max_x3d, max_y3d, x3d, y3d);
-
         double level_danger = 0.0;
-        if (hour_idx >= 0 && hour_idx < (int)arrays_3d->size()) {
-            const Array3D& arr = (*arrays_3d)[hour_idx];
-            if (level >= 0 && level < arr.levels) level_danger = arr.at(level, y3d, x3d);
-        }
+        if (hour_idx >= 0 && hour_idx < (int)arrays_3d->size())
+            level_danger = sample3d((*arrays_3d)[hour_idx], level, px, py, scale_x, scale_y);
 
         std::pair<double, int> result(base_danger + level_danger + level_penalty, hour_idx);
         cache.put(key, result.first, (int32_t)result.second);
@@ -889,7 +896,6 @@ struct Environment {
     std::string map_path;
     int height = 0, width = 0;
     int array_levels = 0, array_height = 0, array_width = 0;
-    int MAX_X_3D = 0, MAX_Y_3D = 0;
     double SCALE_X = 1.0, SCALE_Y = 1.0;
 
     Environment(const std::string& map_file, const std::vector<std::string>& array_files) {
@@ -918,6 +924,7 @@ struct Environment {
             arr.height = (int)a.shape[1];
             arr.width  = (int)a.shape[2];
             arr.v      = std::move(a.data);
+            for (double& v : arr.v) v = hyperbolic_danger(v);
             arrays_3d.push_back(std::move(arr));
         }
         if (arrays_3d.empty())
@@ -926,8 +933,6 @@ struct Environment {
         array_levels = arrays_3d[0].levels;
         array_height = arrays_3d[0].height;
         array_width  = arrays_3d[0].width;
-        MAX_X_3D = array_width - 1;
-        MAX_Y_3D = array_height - 1;
         SCALE_Y = (double)height / (double)array_height;
         SCALE_X = (double)width  / (double)array_width;
 
@@ -1146,7 +1151,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                                        double danger_weight, double length_penalty,
                                        double goal_tolerance, long long max_nodes,
                                        double scale_x, double scale_y,
-                                       int max_x3d, int max_y3d,
                                        int hour_lookahead, double hour_stay_distance,
                                        double hour_switch_penalty,
                                        DijkstraArena& arena) {
@@ -1191,9 +1195,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             const int ny_real = gy * step_size;
             if (nx_real >= width || ny_real >= height) continue;
 
-            int x3d, y3d;
-            map_to_3d_coords((double)nx_real, (double)ny_real, scale_x, scale_y,
-                             max_x3d, max_y3d, x3d, y3d);
             const double base_danger = danger_cache_2d.at(ny_real, nx_real);
             double* __restrict blk = danger_grid.data() + IDX(gy, gx, 0, 0);
 
@@ -1201,8 +1202,9 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                 const double lp = level_penalties[level];
                 double* __restrict row = blk + (size_t)level * max_hours;
                 for (int hour = 0; hour < max_hours; ++hour) {
-                    const Array3D& arr = arrays_3d_list[hour];
-                    double level_danger = (level < arr.levels) ? arr.at(level, y3d, x3d) : 0.0;
+                    const double level_danger =
+                        sample3d(arrays_3d_list[hour], level,
+                                 (double)nx_real, (double)ny_real, scale_x, scale_y);
                     row[hour] = base_danger + level_danger + lp;
                 }
             }
@@ -1389,6 +1391,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         int nb_cnt = 0;
         int    nb_dir[8];
         size_t nb_block[8];
+        size_t nb_side1[8];
+        size_t nb_side2[8];
         for (int d = 0; d < 8; ++d) {
             const int ngx = gx + directions[d].dx;
             const int ngy = gy + directions[d].dy;
@@ -1399,6 +1403,13 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             if (!validity_cache.at(ny_real, nx_real)) continue;
             nb_dir[nb_cnt] = d;
             nb_block[nb_cnt] = ((size_t)ngy * grid_w + ngx) * BLOCK;
+            if (d >= 4) {
+                nb_side1[nb_cnt] = ((size_t)gy * grid_w + ngx) * BLOCK;
+                nb_side2[nb_cnt] = ((size_t)ngy * grid_w + gx) * BLOCK;
+            } else {
+                nb_side1[nb_cnt] = 0;
+                nb_side2[nb_cnt] = 0;
+            }
             nb_cnt++;
         }
 
@@ -1425,6 +1436,9 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             const size_t nblock = nb_block[k];
             const double* __restrict dg_blk = danger_grid.data() + nblock;
             const double* __restrict mn_blk = min_nb_danger.data() + nblock;
+            const bool diag = d >= 4;
+            const double* __restrict s1_blk = diag ? danger_grid.data() + nb_side1[k] : nullptr;
+            const double* __restrict s2_blk = diag ? danger_grid.data() + nb_side2[k] : nullptr;
 
             int lvl_lo = -lookahead_levels;
             if (level + lvl_lo < 0) lvl_lo = -level;
@@ -1435,9 +1449,9 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                 const int next_level = level + lvl_shift;
 
                 double new_stay;
-                if (lvl_shift > 0)      new_stay = level_stay_multiplier * lvl_shift;
-                else if (lvl_shift < 0) new_stay = 0.0;
-                else {
+                if (lvl_shift > 0) {
+                    new_stay = level_stay_multiplier * lvl_shift;
+                } else {
                     new_stay = current_stay - step_distance;
                     if (new_stay < 0.0) new_stay = 0.0;
                 }
@@ -1473,7 +1487,12 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                         if (new_hour_stay < 0.0) new_hour_stay = 0.0;
                     }
 
-                    const double total_danger = dg_blk[lvl_off + target_hour];
+                    double total_danger = dg_blk[lvl_off + target_hour];
+                    if (diag) {
+                        const double corner = std::min(s1_blk[lvl_off + target_hour],
+                                                       s2_blk[lvl_off + target_hour]);
+                        if (corner > total_danger) total_danger = corner;
+                    }
 
                     const double danger_cost = total_danger * danger_weight;
                     const double hour_change_cost =
@@ -1517,12 +1536,21 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     const double new_cost = cur_cost + step_cost;
 
                     const size_t ni = nblock + lvl_off + target_hour;
+                    if (visited[ni]) {
+                        if (!loitered && target_hour == max_hours - 1 &&
+                            base_hour + hour_shift >= max_hours - 1) break;
+                        continue;
+                    }
                     if (new_cost < dist_grid[ni]) {
                         dist_grid[ni] = new_cost;
                         aux[ni] = StateAux{stay_out, new_hour_stay, new_total_distance};
                         prev_state[ni] = (uint32_t)cur_ni;
 
                         heap.push(new_cost + h_val, new_cost, (uint32_t)ni);
+                    } else if (new_cost == dist_grid[ni] &&
+                               new_total_distance < aux[ni].total_dist) {
+                        aux[ni] = StateAux{stay_out, new_hour_stay, new_total_distance};
+                        prev_state[ni] = (uint32_t)cur_ni;
                     }
 
                     if (!loitered && target_hour == max_hours - 1 &&
@@ -1532,8 +1560,12 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         }
     }
 
+    if (nodes_processed >= max_nodes)
+        log_error("Поиск оборван по лимиту узлов, маршрут может быть неоптимален");
+
     if (!goal_found) {
         double best_cost = inf;
+        const double* hg = arena.hgrid.data();
         for (int gy = 0; gy < grid_h; ++gy) {
             for (int gx = 0; gx < grid_w; ++gx) {
                 const int lvl = goal_level;
@@ -1543,7 +1575,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     const double real_y = (double)gy * step_size;
                     if (std::fabs(real_x - goal_x) <= goal_tolerance * 3 &&
                         std::fabs(real_y - goal_y) <= goal_tolerance * 3) {
-                        const double c = dist_grid[IDX(gy, gx, lvl, hr)];
+                        const double c = dist_grid[IDX(gy, gx, lvl, hr)] +
+                                         hg[(size_t)gy * grid_w + gx];
                         if (c < best_cost) {
                             best_cost = c;
                             gs_gx = gx; gs_gy = gy; gs_l = lvl; gs_h = hr;
@@ -1751,7 +1784,7 @@ static double path_fitness(const double* __restrict xs, const double* __restrict
                            const GridBool& validity_cache, const Grid2D& danger_cache_2d,
                            const std::vector<Array3D>& arrays_3d_list,
                            const double* level_penalties,
-                           double scale_x, double scale_y, int max_x3d, int max_y3d,
+                           double scale_x, double scale_y,
                            double w_length, double w_safety, double w_smooth,
                            double w_level_change, double flight_speed, int max_hours) {
     if (n < 2) return 1e18;
@@ -1777,11 +1810,9 @@ static double path_fitness(const double* __restrict xs, const double* __restrict
         int array_idx = (int)py_trunc_i(time_hours);
         if (array_idx < 0) array_idx = 0;
         if (array_idx >= max_hours) array_idx = max_hours - 1;
-        int x3d, y3d;
-        map_to_3d_coords(xs[i], ys[i], scale_x, scale_y, max_x3d, max_y3d, x3d, y3d);
         const int lvl = levels[i];
-        const Array3D& arr = arrays_3d_list[array_idx];
-        const double level_danger = (lvl < arr.levels) ? arr.at(lvl, y3d, x3d) : 0.0;
+        const double level_danger =
+            sample3d(arrays_3d_list[array_idx], lvl, xs[i], ys[i], scale_x, scale_y);
         const double base_danger =
             danger_cache_2d.at((int)py_round_i(ys[i]), (int)py_round_i(xs[i]));
         total_danger += base_danger + level_danger + level_penalties[lvl];
@@ -1904,7 +1935,7 @@ static OptimizeResult optimize_path_with_fixed_weights(
         return path_fitness(xs, ys, lv, td, n,
                             env.map2_cache->validity_cache, env.map2_cache->danger_cache,
                             env.arrays_3d, cfg::LEVEL_PENALTIES,
-                            env.SCALE_X, env.SCALE_Y, env.MAX_X_3D, env.MAX_Y_3D,
+                            env.SCALE_X, env.SCALE_Y,
                             w.length, w.safety, w.smoothness, w.level_change,
                             cfg::FLIGHT_SPEED * cfg::HOURS_PER_ARRAY_SLICE,
                             (int)env.arrays_3d.size());
@@ -1919,11 +1950,16 @@ static OptimizeResult optimize_path_with_fixed_weights(
                         cand_ttd(MAXC * n_points), cand_fit(MAXC);
     std::vector<int>    cand_lv(MAXC * n_points);
 
-    for (int iteration = 0; iteration < cfg::NUM_ITERATIONS; ++iteration) {
-        double best_fitness = fitness_of(path_xs, path_ys, path_levels, path_total_distances);
+    double best_seen = fitness_of(path_xs, path_ys, path_levels, path_total_distances);
+    std::vector<double> best_xs = path_xs, best_ys = path_ys, best_td = path_total_distances;
+    std::vector<int>    best_lv = path_levels;
 
+    for (int iteration = 0; iteration < cfg::NUM_ITERATIONS; ++iteration) {
         for (int i = 1; i < n_points - 1; ++i) {
             if (frozen && frozen[i]) continue;
+
+            double best_fitness =
+                fitness_of(path_xs, path_ys, path_levels, path_total_distances);
 
             const double cur_x = path_xs[i], cur_y = path_ys[i];
             const int    current_level = path_levels[i];
@@ -2007,11 +2043,27 @@ static OptimizeResult optimize_path_with_fixed_weights(
             lvl_dist = level_distances(path_xs, path_ys, path_levels);
         }
 
-        path_stay_requirements = recompute_stay_requirements(path_levels);
         const double current_fitness =
             fitness_of(path_xs, path_ys, path_levels, path_total_distances);
         best_fitness_progress.push_back(current_fitness);
+        if (current_fitness < best_seen) {
+            best_seen = current_fitness;
+            best_xs = path_xs;
+            best_ys = path_ys;
+            best_td = path_total_distances;
+            best_lv = path_levels;
+        }
     }
+
+    path_xs = std::move(best_xs);
+    path_ys = std::move(best_ys);
+    path_total_distances = std::move(best_td);
+    path_levels = std::move(best_lv);
+    path_stay_requirements = recompute_stay_requirements(path_levels);
+    path_array_indices.assign(path_total_distances.size(), 0);
+    for (size_t k = 0; k < path_total_distances.size(); ++k)
+        path_array_indices[k] = (int)distance_to_hour_index(
+            path_total_distances[k], (double)env.arrays_3d.size());
 
     OptimizeResult r;
     r.xs = std::move(path_xs);
@@ -2025,6 +2077,7 @@ static OptimizeResult optimize_path_with_fixed_weights(
 }
 
 struct SegmentResult {
+    int goal_level_used = -1;
     std::vector<double> d_xs, d_ys;
     std::vector<int>    d_levels;
     std::vector<double> d_stay, d_total;
@@ -2072,7 +2125,7 @@ static SegmentResult run_segment_pipeline(double sx, double sy, double ex, doubl
         cfg::SAFETY_WEIGHT * cfg::DIJKSTRA_DANGER_WEIGHT,
         cfg::LENGTH_WEIGHT * cfg::DIJKSTRA_LENGTH_PENALTY,
         cfg::DIJKSTRA_GOAL_TOLERANCE, cfg::MAX_NODES,
-        env.SCALE_X, env.SCALE_Y, env.MAX_X_3D, env.MAX_Y_3D,
+        env.SCALE_X, env.SCALE_Y,
         hour_lookahead, cfg::HOUR_STAY_DISTANCE, cfg::HOUR_SWITCH_PENALTY, arena);
 
     if (!raw.ok || raw.px.empty()) {
@@ -2106,6 +2159,7 @@ static SegmentResult run_segment_pipeline(double sx, double sy, double ex, doubl
     res.fitness_progress = std::move(opt.fitness_progress);
     res.o_length = compute_path_length(res.o_xs, res.o_ys);
 
+    res.goal_level_used = goal_level;
     res.ok = true;
     return res;
 }
@@ -2421,14 +2475,16 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
     DijkstraArena arena;
 
     std::vector<SegmentResult> segs;
+    int carry_level = -1;
     for (size_t i = 0; i + 1 < route_xy.size(); ++i) {
         SegmentResult sr = run_segment_pipeline(route_xy[i].first, route_xy[i].second,
                                                 route_xy[i + 1].first, route_xy[i + 1].second,
-                                                *env, -1, -1, hour_lookahead, arena);
+                                                *env, carry_level, -1, hour_lookahead, arena);
         if (!sr.ok) {
             log_error("Segment " + std::to_string(i + 1) + " failed, route not built");
             return {};
         }
+        carry_level = sr.goal_level_used;
         segs.push_back(std::move(sr));
     }
 
