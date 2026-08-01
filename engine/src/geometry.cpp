@@ -4,7 +4,7 @@
 #include "config.hpp"
 #include "util.hpp"
 
-namespace astar {
+namespace engine {
 
 bool line_clear(double x1, double y1, double x2, double y2, const GridBool& valid) {
     long x1i = py_round_i(x1), y1i = py_round_i(y1);

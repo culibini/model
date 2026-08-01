@@ -6,12 +6,12 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "astar/types.hpp"
+#include "engine/types.hpp"
 #include "config.hpp"
 #include "mem.hpp"
 #include "util.hpp"
 
-namespace astar {
+namespace engine {
 
 struct GridBool {
     int width = 0, height = 0;

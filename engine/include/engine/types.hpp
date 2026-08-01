@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace astar {
+namespace engine {
 
 struct Grid2D {
     int width = 0, height = 0;

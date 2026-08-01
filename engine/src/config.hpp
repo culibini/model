@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace astar {
+namespace engine {
 namespace cfg {
 
 constexpr double LENGTH_WEIGHT         = 1.0;

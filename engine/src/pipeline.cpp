@@ -1,4 +1,4 @@
-#include "astar/router.hpp"
+#include "engine/router.hpp"
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -10,7 +10,7 @@
 #include "search.hpp"
 #include "util.hpp"
 
-namespace astar {
+namespace engine {
 
 struct SegmentResult {
     int goal_level_used = -1;

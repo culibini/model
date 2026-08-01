@@ -2,7 +2,7 @@
 #include <cmath>
 #include <random>
 
-namespace astar {
+namespace engine {
 struct NumpyRandom {
     std::mt19937 mt;
     bool   has_gauss = false;

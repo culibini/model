@@ -1,10 +1,10 @@
 #pragma once
 #include <vector>
-#include "astar/types.hpp"
+#include "engine/types.hpp"
 #include "danger.hpp"
 #include "rng.hpp"
 
-namespace astar {
+namespace engine {
 
 bool line_clear(double x1, double y1, double x2, double y2, const GridBool& valid);
 void generate_candidates(double center_x, double center_y, int num_candidates,

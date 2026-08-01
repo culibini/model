@@ -6,7 +6,7 @@
 #include "geometry.hpp"
 #include "util.hpp"
 
-namespace astar {
+namespace engine {
 
 static void materialize_loiter_loops(DijkstraRaw& r,
                                      const double* danger_grid,

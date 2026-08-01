@@ -3,7 +3,7 @@
 #include "danger.hpp"
 #include "rng.hpp"
 
-namespace astar {
+namespace engine {
 
 struct Weights { double safety, length, smoothness, level_change; };
 

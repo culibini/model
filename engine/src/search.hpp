@@ -3,7 +3,7 @@
 #include "danger.hpp"
 #include "mem.hpp"
 
-namespace astar {
+namespace engine {
 
 struct HeapPayload {
     double   cost;

@@ -12,7 +12,7 @@
 #include <omp.h>
 #endif
 
-namespace astar {
+namespace engine {
 
 template <typename T>
 struct Buf {

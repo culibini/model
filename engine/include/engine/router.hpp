@@ -1,9 +1,9 @@
 #pragma once
 #include <utility>
 #include <vector>
-#include "astar/types.hpp"
+#include "engine/types.hpp"
 
-namespace astar {
+namespace engine {
 
 std::vector<RoutePoint> calculate_path(
     const Grid2D& danger_map,

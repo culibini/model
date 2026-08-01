@@ -1,11 +1,11 @@
 CXX      ?= g++
 CXXFLAGS  = -O3 -std=c++17 -Wall -Wextra -pthread -fopenmp -fPIC
 
-LIBDIR   = astar
+LIBDIR   = engine
 BUILDDIR = build
 SRC      = $(wildcard $(LIBDIR)/src/*.cpp)
 OBJ      = $(patsubst $(LIBDIR)/src/%.cpp,$(BUILDDIR)/%.o,$(SRC))
-LIB      = $(LIBDIR)/libastar.so
+LIB      = $(LIBDIR)/libengine.so
 
 all: $(LIB)
 

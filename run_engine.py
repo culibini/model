@@ -8,12 +8,12 @@ import numpy as np
 
 def load_library():
     here = Path(__file__).resolve().parent
-    return ctypes.CDLL(str(here / "astar" / "libastar.so"))
+    return ctypes.CDLL(str(here / "engine" / "libengine.so"))
 
 
 def bind(lib):
-    lib.astar_calculate_path.restype = ctypes.POINTER(ctypes.c_longlong)
-    lib.astar_calculate_path.argtypes = [
+    lib.engine_calculate_path.restype = ctypes.POINTER(ctypes.c_longlong)
+    lib.engine_calculate_path.argtypes = [
         ctypes.POINTER(ctypes.c_double), ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_double), ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -21,8 +21,8 @@ def bind(lib):
         ctypes.c_double, ctypes.c_uint, ctypes.c_uint,
         ctypes.POINTER(ctypes.c_int),
     ]
-    lib.astar_free.restype = None
-    lib.astar_free.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
+    lib.engine_free.restype = None
+    lib.engine_free.argtypes = [ctypes.POINTER(ctypes.c_longlong)]
 
 
 def parse_args(argv):
@@ -51,7 +51,7 @@ def calculate(lib, danger_map, forecasts, points, wastar, threads, seed):
     p = np.ascontiguousarray(np.array(points, dtype=np.float64).reshape(-1))
     out_n = ctypes.c_int(0)
     t0 = time.perf_counter()
-    ptr = lib.astar_calculate_path(
+    ptr = lib.engine_calculate_path(
         m.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), m.shape[0], m.shape[1],
         f.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), f.shape[0],
         f.shape[1], f.shape[2], f.shape[3],
@@ -65,7 +65,7 @@ def calculate(lib, danger_map, forecasts, points, wastar, threads, seed):
     if n == 0:
         return None, dt
     route = np.ctypeslib.as_array(ptr, shape=(n, 3)).copy()
-    lib.astar_free(ptr)
+    lib.engine_free(ptr)
     return route, dt
 
 

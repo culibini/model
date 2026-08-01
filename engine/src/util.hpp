@@ -1,7 +1,7 @@
 #pragma once
 #include <cmath>
 
-namespace astar {
+namespace engine {
 static inline double py_round(double x) { return std::nearbyint(x); }
 static inline long   py_round_i(double x) { return (long)std::nearbyint(x); }
 

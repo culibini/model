@@ -6,7 +6,7 @@
 #include "mem.hpp"
 #include "util.hpp"
 
-namespace astar {
+namespace engine {
 
 Weights calculate_fixed_weights(double path_length) {
     double safety = cfg::SAFETY_WEIGHT *
