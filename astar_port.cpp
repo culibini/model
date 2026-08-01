@@ -153,6 +153,20 @@ struct Buf {
         uninit(count);
         std::fill(p, p + count, v);
     }
+    void grow(size_t count) {
+        T* old_p = p;
+        size_t old_n = n;
+        size_t old_map = map_bytes;
+        p = nullptr; map_bytes = 0; n = 0;
+        uninit(count);
+        if (old_p) {
+            std::memcpy(p, old_p, old_n * sizeof(T));
+#ifdef __linux__
+            if (old_map) { ::munmap((void*)old_p, old_map); old_p = nullptr; }
+#endif
+            std::free(old_p);
+        }
+    }
 
     inline T& operator[](size_t i) { return p[i]; }
     inline const T& operator[](size_t i) const { return p[i]; }
@@ -164,7 +178,7 @@ static unsigned g_threads = 0;
 
 static double g_wastar = 1.0;
 
-static unsigned thread_count() {
+[[maybe_unused]] static unsigned thread_count() {
     if (g_threads) return g_threads;
 #ifdef _OPENMP
     return (unsigned)omp_get_max_threads();
@@ -292,9 +306,7 @@ struct Timer {
     }
 };
 
-static void log_info(const std::string& s)  { std::cout << "[INFO ] " << s << "\n"; }
-static void log_warn(const std::string& s)  { std::cout << "[WARN ] " << s << "\n"; }
-static void log_error(const std::string& s) { std::cout << "[ERROR] " << s << "\n"; }
+static void log_error(const std::string& s) { std::cerr << s << "\n"; }
 
 struct NpyArray {
     std::vector<size_t> shape;
@@ -717,12 +729,6 @@ struct DangerMapCache {
         validity_cache.width = width;
         validity_cache.height = height;
         validity_cache.v.assign((size_t)width * height, 1);
-
-        double mb = (double)(validity_cache.v.size() * sizeof(uint8_t) +
-                             danger_cache.v.size() * sizeof(double)) / 1024.0 / 1024.0;
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "Кеш создан: %dx%d, память: %.1f MB", width, height, mb);
-        std::cout << buf << "\n";
     }
 
     static Grid2D apply_hyperbolic_penalty(const Grid2D& base_in) {
@@ -880,7 +886,7 @@ struct Environment {
     DangerMapCache*   map2_cache = nullptr;
     DangerValueCache* danger_cache = nullptr;
     std::vector<Array3D> arrays_3d;
-    Grid2D raw_map;
+    std::string map_path;
     int height = 0, width = 0;
     int array_levels = 0, array_height = 0, array_width = 0;
     int MAX_X_3D = 0, MAX_Y_3D = 0;
@@ -891,14 +897,16 @@ struct Environment {
         if (m.shape.size() != 2)
             throw std::runtime_error("ValueError: map must be 2D, got ndim=" +
                                      std::to_string(m.shape.size()));
-        raw_map.height = (int)m.shape[0];
-        raw_map.width  = (int)m.shape[1];
-        raw_map.v      = m.data;
+        map_path = map_file;
+        Grid2D base_map;
+        base_map.height = (int)m.shape[0];
+        base_map.width  = (int)m.shape[1];
+        base_map.v      = std::move(m.data);
 
-        height = raw_map.height;
-        width  = raw_map.width;
+        height = base_map.height;
+        width  = base_map.width;
 
-        map2_cache = new DangerMapCache(raw_map);
+        map2_cache = new DangerMapCache(base_map);
 
         for (const auto& p : array_files) {
             if (!file_exists(p)) continue;
@@ -954,6 +962,11 @@ struct Heap {
     }
 
     void push(double priority, double cost, uint32_t state) {
+        if (size == capacity) {
+            capacity *= 2;
+            pri.grow((size_t)capacity);
+            pay.grow((size_t)capacity);
+        }
         double*      __restrict p  = pri.data();
         HeapPayload* __restrict pl = pay.data();
         long long idx = size;
@@ -1113,14 +1126,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
             ? cfg::LEVEL_STAY_MULTIPLIER * (lvl[i] - lvl[i - 1]) : 0.0;
     }
 
-    {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-                      "Ожидания материализованы: %zu -> %zu точек (+%ld точек петель)",
-                      n, m, total_loop_points);
-        log_info(buf);
-    }
-
     r.px = std::move(px);
     r.py = std::move(py);
     r.levels = std::move(lvl);
@@ -1161,15 +1166,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     auto IDX = [&](int gy, int gx, int l, int h) -> size_t {
         return (((size_t)gy * grid_w + gx) * num_levels + l) * max_hours + h;
     };
-
-    {
-        double gb = (double)N4 * (8.0 * 5 + 4.0 * 4 + 1.0) / 1024.0 / 1024.0 / 1024.0;
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "Сетка поиска: %dx%d x %d уровней x %d часов = %.2fM состояний, ~%.2f GB",
-                      grid_w, grid_h, num_levels, max_hours, (double)N4 / 1e6, gb);
-        log_info(buf);
-    }
 
     const size_t BLOCK = (size_t)num_levels * max_hours;
 
@@ -1357,7 +1353,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     };
 
     long long nodes_processed = 0;
-    long long pushes_dropped = 0;
     bool goal_found = false;
     int gs_gx = start_gx, gs_gy = start_gy, gs_l = start_level, gs_h = start_hour;
 
@@ -1470,9 +1465,11 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
                     if (target_hour < hour_idx) continue;
 
+                    const int intentional_shift = target_hour - base_hour;
+
                     double new_hour_stay;
-                    if (target_hour > hour_idx) {
-                        new_hour_stay = hour_stay_distance * (target_hour - hour_idx);
+                    if (intentional_shift > 0) {
+                        new_hour_stay = hour_stay_distance * intentional_shift;
                     } else {
                         new_hour_stay = current_hour_stay - step_distance;
                         if (new_hour_stay < 0.0) new_hour_stay = 0.0;
@@ -1482,12 +1479,13 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
                     const double danger_cost = total_danger * danger_weight;
                     const double hour_change_cost =
-                        hour_switch_penalty * (target_hour - hour_idx);
+                        hour_switch_penalty * (intentional_shift > 0 ? intentional_shift : 0);
 
                     double added_cost = 0.0;
+                    double stay_out = new_stay;
                     bool   loitered = false;
 
-                    if (target_hour > base_hour) {
+                    if (intentional_shift > 0) {
                         const double required_distance = (double)target_hour * flight_speed;
                         const double need_extra = required_distance - new_total_distance;
                         if (need_extra > 0.0 && nb_ok) {
@@ -1511,6 +1509,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                             }
                             added_cost = add_c;
                             new_total_distance += need_extra;
+                            stay_out = new_stay - need_extra;
+                            if (stay_out < 0.0) stay_out = 0.0;
                         }
                     }
 
@@ -1521,13 +1521,10 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     const size_t ni = nblock + lvl_off + target_hour;
                     if (new_cost < dist_grid[ni]) {
                         dist_grid[ni] = new_cost;
-                        aux[ni] = StateAux{new_stay, new_hour_stay, new_total_distance};
+                        aux[ni] = StateAux{stay_out, new_hour_stay, new_total_distance};
                         prev_state[ni] = (uint32_t)cur_ni;
 
-                        if (heap.size < heap.capacity)
-                            heap.push(new_cost + h_val, new_cost, (uint32_t)ni);
-                        else
-                            pushes_dropped++;
+                        heap.push(new_cost + h_val, new_cost, (uint32_t)ni);
                     }
 
                     if (!loitered && target_hour == max_hours - 1 &&
@@ -1560,28 +1557,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         if (best_cost < inf) goal_found = true;
     }
 
-    {
-        char buf[240];
-        std::snprintf(buf, sizeof(buf), "Обработано узлов: %lld", nodes_processed);
-        log_info(buf);
-        if (pushes_dropped > 0) {
-            std::snprintf(buf, sizeof(buf),
-                          "ВНИМАНИЕ: куча переполнялась, отброшено %lld пушей — "
-                          "поиск мог потерять оптимальность (поведение унаследовано "
-                          "от питона)", pushes_dropped);
-            log_warn(buf);
-        }
-    }
-
     if (!goal_found) { out.ok = false; return out; }
-
-    {
-
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "Стоимость цели: %.6f",
-                      dist_grid[IDX(gs_gy, gs_gx, gs_l, gs_h)]);
-        log_info(buf);
-    }
 
     std::vector<double> ppx, ppy, pstay, pdist;
     std::vector<int> plvl, parr;
@@ -1642,7 +1618,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
         const std::vector<double>& path_total, const std::vector<int>& path_arrays,
         const std::vector<uint8_t>& path_frozen,
         int arrays_count, double goal_x, double goal_y, int goal_level,
-        double max_step = 20.0) {
+        double max_step = (double)cfg::DIJKSTRA_STEP_SIZE) {
 
     RefinedPath r;
     if (path_x.empty()) return r;
@@ -1651,11 +1627,8 @@ static RefinedPath refine_path_to_goal_with_constraints(
         return i < path_frozen.size() ? path_frozen[i] : 0;
     };
 
-    auto buggy_hour = [&](double dist) -> int {
-        return (int)distance_to_hour_index(dist,
-                                           cfg::FLIGHT_SPEED,
-                                           cfg::HOURS_PER_ARRAY_SLICE,
-                                           (double)arrays_count);
+    auto hour_of = [&](double dist) -> int {
+        return (int)distance_to_hour_index(dist, (double)arrays_count);
     };
 
     r.xs.push_back(path_x[0]);
@@ -1712,7 +1685,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
                 r.levels.push_back(interpolated_lvl);
                 r.stay.push_back(interpolated_stay);
                 r.total_dist.push_back(interpolated_dist);
-                r.arrays.push_back(buggy_hour(interpolated_dist));
+                r.arrays.push_back(hour_of(interpolated_dist));
 
                 r.frozen.push_back(fz(i) && fz(i + 1) ? 1 : 0);
             }
@@ -1742,7 +1715,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
             r.levels.push_back(interpolated_lvl);
             r.stay.push_back(interpolated_stay);
             r.total_dist.push_back(interpolated_dist);
-            r.arrays.push_back(buggy_hour(interpolated_dist));
+            r.arrays.push_back(hour_of(interpolated_dist));
             r.frozen.push_back(0);
         }
     }
@@ -1755,48 +1728,14 @@ static RefinedPath refine_path_to_goal_with_constraints(
                              hypot2(goal_x - r.xs[k - 2], goal_y - r.ys[k - 2]);
     r.total_dist.push_back(goal_dist);
     r.stay.push_back(0.0);
-    r.arrays.push_back(buggy_hour(goal_dist));
+    r.arrays.push_back(hour_of(goal_dist));
 
-    {
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "Path refined: %zu -> %zu points",
-                      path_x.size(), r.xs.size());
-        log_info(buf);
-    }
+    for (size_t i = 1; i < r.stay.size(); ++i)
+        r.stay[i] = (r.levels[i] > r.levels[i - 1])
+            ? cfg::LEVEL_STAY_MULTIPLIER * (r.levels[i] - r.levels[i - 1]) : 0.0;
+    if (!r.stay.empty()) r.stay[0] = 0.0;
+
     return r;
-}
-
-static void check_stay_requirements(const std::vector<int>& levels,
-                                    const std::vector<double>& stay) {
-    log_info("Checking stay requirements...");
-    int violations = 0;
-    for (size_t i = 1; i < levels.size(); ++i) {
-        if (levels[i] > levels[i - 1]) {
-            const double required = cfg::LEVEL_STAY_MULTIPLIER * (levels[i] - levels[i - 1]);
-            if (stay[i] != required) violations++;
-        }
-    }
-    if (violations == 0) log_info("All stay requirements satisfied");
-    else log_warn("Violations found: " + std::to_string(violations));
-}
-
-static void analyze_array_usage(const std::vector<int>& arr_idx, int total_arrays) {
-    log_info("3D ARRAY USAGE ANALYSIS:");
-    std::map<int, int> usage;
-    for (int i = 0; i < total_arrays; ++i) usage[i] = 0;
-    for (int v : arr_idx) { auto it = usage.find(v); if (it != usage.end()) it->second++; }
-    const size_t total_points = arr_idx.size();
-    int unique_hours = 0;
-    for (auto& kv : usage) {
-        double pct = total_points == 0 ? 0.0 : (double)kv.second / total_points * 100.0;
-        char buf[160];
-        std::snprintf(buf, sizeof(buf), "  • Array %d: %d points (%.1f%%)",
-                      kv.first, kv.second, pct);
-        log_info(buf);
-        if (kv.second > 0) unique_hours++;
-    }
-    log_info("  • Hours used: " + std::to_string(unique_hours) + " out of " +
-             std::to_string(total_arrays));
 }
 
 struct Weights { double safety, length, smoothness, level_change; };
@@ -1805,10 +1744,7 @@ static Weights calculate_fixed_weights(double path_length) {
     double safety = cfg::SAFETY_WEIGHT *
                     (1.0 + cfg::SAFETY_WEIGHT_COEFF * (path_length / cfg::BASE_PATH_LENGTH));
     safety = std::max(cfg::SAFETY_WEIGHT, std::min(safety, cfg::SAFETY_WEIGHT * 3.0));
-    double length = cfg::LENGTH_WEIGHT *
-                    (1.0 + cfg::LENGTH_WEIGHT_COEFF * (path_length / cfg::BASE_PATH_LENGTH));
-    length = std::max(cfg::LENGTH_WEIGHT, std::min(length, cfg::LENGTH_WEIGHT * 2.0));
-    return {safety, length, cfg::SMOOTHNESS_WEIGHT, cfg::LEVEL_CHANGE_PENALTY};
+    return {safety, cfg::LENGTH_WEIGHT, cfg::SMOOTHNESS_WEIGHT, cfg::LEVEL_CHANGE_PENALTY};
 }
 
 static double path_fitness(const double* __restrict xs, const double* __restrict ys,
@@ -1955,25 +1891,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
 
     const uint8_t* frozen =
         frozen_pts.size() == init_xs.size() ? frozen_pts.data() : nullptr;
-    {
-        size_t nfz = 0;
-        for (uint8_t f : frozen_pts) nfz += f;
-        if (nfz > 0)
-            log_info("Заморожено точек ожидания (стадия 2 их не трогает): " +
-                     std::to_string(nfz));
-    }
-
-    log_info("Launching path optimization with fixed weights");
-    {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-                      "   • Safety %.2f | Length %.2f | Smooth %.0f | LevelChange %.2f",
-                      w.safety, w.length, w.smoothness, w.level_change);
-        log_info(buf);
-    }
-
-    Timer opt_timer;
-
     std::vector<double> path_xs = init_xs, path_ys = init_ys;
     std::vector<int>    path_levels = init_levels;
     std::vector<double> path_stay_requirements = init_stay;
@@ -1991,7 +1908,8 @@ static OptimizeResult optimize_path_with_fixed_weights(
                             env.arrays_3d, cfg::LEVEL_PENALTIES,
                             env.SCALE_X, env.SCALE_Y, env.MAX_X_3D, env.MAX_Y_3D,
                             w.length, w.safety, w.smoothness, w.level_change,
-                            cfg::FLIGHT_SPEED, (int)env.arrays_3d.size());
+                            cfg::FLIGHT_SPEED * cfg::HOURS_PER_ARRAY_SLICE,
+                            (int)env.arrays_3d.size());
     };
     auto fitness_of = [&](const std::vector<double>& xs, const std::vector<double>& ys,
                           const std::vector<int>& lv, const std::vector<double>& td) {
@@ -2004,15 +1922,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
     std::vector<int>    cand_lv(MAXC * n_points);
 
     for (int iteration = 0; iteration < cfg::NUM_ITERATIONS; ++iteration) {
-        Timer it_timer;
-        {
-            char buf[80];
-            std::snprintf(buf, sizeof(buf), "  Iteration %d/%d",
-                          iteration + 1, cfg::NUM_ITERATIONS);
-            log_info(buf);
-        }
-        long iteration_improvement = 0;
-
         double best_fitness = fitness_of(path_xs, path_ys, path_levels, path_total_distances);
 
         for (int i = 1; i < n_points - 1; ++i) {
@@ -2079,7 +1988,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
                     best_cx = cand_x[c];
                     best_cy = cand_y[c];
                     best_level = cand_lv[c * n_points + i];
-                    iteration_improvement++;
                 }
             }
 
@@ -2105,18 +2013,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
         const double current_fitness =
             fitness_of(path_xs, path_ys, path_levels, path_total_distances);
         best_fitness_progress.push_back(current_fitness);
-
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-                      "  Improved points: %ld, Fitness: %.2f, Time: %.2fs",
-                      iteration_improvement, current_fitness, it_timer.sec());
-        log_info(buf);
-    }
-
-    {
-        char buf[120];
-        std::snprintf(buf, sizeof(buf), "Optimization finished in %.2f seconds", opt_timer.sec());
-        log_info(buf);
     }
 
     OptimizeResult r;
@@ -2154,38 +2050,16 @@ static double compute_path_length(const std::vector<double>& xs, const std::vect
     return s;
 }
 
-static SegmentResult run_segment_pipeline(int segment_idx,
-                                          double sx, double sy, double ex, double ey,
+static SegmentResult run_segment_pipeline(double sx, double sy, double ex, double ey,
                                           Environment& env,
                                           int start_level_in, int end_level_in,
                                           int hour_lookahead, DijkstraArena& arena) {
     SegmentResult res;
 
-    log_info("============================================================");
-    {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "Segment %d: (%.1f, %.1f) -> (%.1f, %.1f)",
-                      segment_idx, sx, sy, ex, ey);
-        log_info(buf);
-    }
-    log_info("============================================================");
-
-    Timer seg_timer;
-
-    log_info("Stage 1: Dijkstra algorithm with static weights");
-    Timer dij_timer;
-
     int start_level = start_level_in;
     int goal_level  = end_level_in;
     if (start_level < 0) start_level = env.danger_cache->find_best_level_for_point(sx, sy, 0.0);
-    if (goal_level  < 0) goal_level  = env.danger_cache->find_best_level_for_point(ex, ey, 0.0);
-
-    {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "   - Start: (%.1f, %.1f) level %d | Goal: (%.1f, %.1f) level %d",
-                      sx, sy, start_level, ex, ey, goal_level);
-        log_info(buf);
-    }
+    if (goal_level  < 0) goal_level  = env.danger_cache->find_best_level_for_point(ex, ey, hypot2(ex - sx, ey - sy));
 
     if (!env.map2_cache->get_cached_validity(sx, sy)) { log_error("Start point invalid"); return res; }
     if (!env.map2_cache->get_cached_validity(ex, ey)) { log_error("Goal point invalid");  return res; }
@@ -2195,7 +2069,8 @@ static SegmentResult run_segment_pipeline(int segment_idx,
         env.map2_cache->validity_cache, env.map2_cache->danger_cache,
         env.arrays_3d, cfg::LEVEL_PENALTIES,
         cfg::DIJKSTRA_STEP_SIZE, cfg::LOOKAHEAD_LEVELS, cfg::LEVEL_STAY_MULTIPLIER,
-        cfg::NUM_LEVELS, cfg::FLIGHT_SPEED, (int)env.arrays_3d.size(),
+        cfg::NUM_LEVELS, cfg::FLIGHT_SPEED * cfg::HOURS_PER_ARRAY_SLICE,
+        (int)env.arrays_3d.size(),
         cfg::SAFETY_WEIGHT * cfg::DIJKSTRA_DANGER_WEIGHT,
         cfg::LENGTH_WEIGHT * cfg::DIJKSTRA_LENGTH_PENALTY,
         cfg::DIJKSTRA_GOAL_TOLERANCE, cfg::MAX_NODES,
@@ -2206,16 +2081,10 @@ static SegmentResult run_segment_pipeline(int segment_idx,
         log_error("Numba kernel failed to build a path");
         return res;
     }
-    log_info("Path found by numba kernel");
 
     RefinedPath ref = refine_path_to_goal_with_constraints(
         raw.px, raw.py, raw.levels, raw.stay, raw.total_dist, raw.arrays,
         raw.frozen, (int)env.arrays_3d.size(), ex, ey, goal_level);
-
-    analyze_array_usage(ref.arrays, (int)env.arrays_3d.size());
-    check_stay_requirements(ref.levels, ref.stay);
-
-    const double dij_time = dij_timer.sec();
 
     res.d_xs = ref.xs; res.d_ys = ref.ys;
     res.d_levels = ref.levels;
@@ -2224,20 +2093,8 @@ static SegmentResult run_segment_pipeline(int segment_idx,
     res.d_arr = ref.arrays;
     res.d_length = compute_path_length(res.d_xs, res.d_ys);
 
-    {
-        int changes = 0;
-        for (size_t i = 1; i < res.d_levels.size(); ++i)
-            if (res.d_levels[i] != res.d_levels[i - 1]) changes++;
-        char buf[240];
-        std::snprintf(buf, sizeof(buf),
-                      "Dijkstra: %zu points, length %.2f px, level changes %d, time %.2fs",
-                      res.d_xs.size(), res.d_length, changes, dij_time);
-        log_info(buf);
-    }
-
     const Weights fixed_weights = calculate_fixed_weights(res.d_length);
 
-    log_info("Stage 2: Path optimization with fixed weights");
     OptimizeResult opt = optimize_path_with_fixed_weights(
         res.d_xs, res.d_ys, res.d_levels, res.d_stay, res.d_total, res.d_arr,
         ref.frozen, fixed_weights, env);
@@ -2250,15 +2107,6 @@ static SegmentResult run_segment_pipeline(int segment_idx,
     res.o_arr = std::move(opt.array_idx);
     res.fitness_progress = std::move(opt.fitness_progress);
     res.o_length = compute_path_length(res.o_xs, res.o_ys);
-
-    {
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "Optimized: %zu points, length %.2f px",
-                      res.o_xs.size(), res.o_length);
-        log_info(buf);
-        std::snprintf(buf, sizeof(buf), "Segment %d total time: %.2fs", segment_idx, seg_timer.sec());
-        log_info(buf);
-    }
 
     res.ok = true;
     return res;
@@ -2539,9 +2387,7 @@ static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& rou
     cv.star(start_x * sc, start_y * sc, 9.0, 0, 150, 0);
     cv.star(goal_x  * sc, goal_y  * sc, 9.0, 0, 60, 220);
 
-    if (write_png(save_path, W, H, cv.px))
-        std::cout << "Карта сохранена: " << save_path << " (" << W << "x" << H << ")\n";
-    else
+    if (!write_png(save_path, W, H, cv.px))
         log_error("Не удалось записать " + save_path);
 }
 
@@ -2556,18 +2402,11 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
     Environment* env = new Environment(map_file, array_files);
     env_out = env;
 
-    log_info("============================================================");
-    log_info("Full algorithm: Dijkstra (static) + Optimization (fixed)");
-    log_info("============================================================");
-
     if (route_xy.size() < 2) {
         log_error("At least two route points are required");
         return {};
     }
 
-    Timer total_timer;
-
-    log_info("Checking all route points...");
     for (size_t i = 0; i < route_xy.size(); ++i) {
         const double x = route_xy[i].first, y = route_xy[i].second;
         if (!(x >= 0 && x < env->width && y >= 0 && y < env->height)) {
@@ -2578,8 +2417,6 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
             throw std::runtime_error(buf);
         }
     }
-    log_info("All route points are valid");
-    log_info("Total segments: " + std::to_string(route_xy.size() - 1));
 
     const int hour_lookahead = get_hour_lookahead_value((int)env->arrays_3d.size());
 
@@ -2587,8 +2424,7 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
 
     std::vector<SegmentResult> segs;
     for (size_t i = 0; i + 1 < route_xy.size(); ++i) {
-        SegmentResult sr = run_segment_pipeline((int)i + 1,
-                                                route_xy[i].first, route_xy[i].second,
+        SegmentResult sr = run_segment_pipeline(route_xy[i].first, route_xy[i].second,
                                                 route_xy[i + 1].first, route_xy[i + 1].second,
                                                 *env, -1, -1, hour_lookahead, arena);
         if (!sr.ok) {
@@ -2600,12 +2436,6 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
 
     CombinedResult cr = stitch_segment_results(segs, *env, nullptr);
     if (!cr.ok) { log_error("Failed to stitch segment results"); return {}; }
-
-    {
-        char buf[120];
-        std::snprintf(buf, sizeof(buf), "Total execution time: %.2fs", total_timer.sec());
-        log_info(buf);
-    }
 
     return build_route_response(cr);
 }
@@ -2627,13 +2457,11 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a.rfind("--threads=", 0) == 0) g_threads = (unsigned)std::atoi(a.c_str() + 10);
         else if (a.rfind("--wastar=", 0) == 0) g_wastar = std::atof(a.c_str() + 9);
+        else if (a.rfind("--seed=", 0) == 0) g_rng.seed((uint32_t)std::strtoul(a.c_str() + 7, nullptr, 10));
         else pos.push_back(a);
     }
     if (!(g_wastar >= 1.0)) g_wastar = 1.0;
     if (g_wastar != 1.0) {
-        char buf[120];
-        std::snprintf(buf, sizeof(buf), "Взвешенный A*: W=%.2f", g_wastar);
-        log_info(buf);
     }
 #ifdef _OPENMP
     if (g_threads) omp_set_num_threads((int)g_threads);
@@ -2642,11 +2470,6 @@ int main(int argc, char** argv) {
         route_points.clear();
         for (size_t i = 0; i + 1 < pos.size(); i += 2)
             route_points.emplace_back(std::atof(pos[i].c_str()), std::atof(pos[i + 1].c_str()));
-    }
-    {
-        char buf[120];
-        std::snprintf(buf, sizeof(buf), "Потоков: %u", thread_count());
-        log_info(buf);
     }
 
     const std::string data_dir = "data";
@@ -2663,40 +2486,33 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         log_error(e.what());
         delete env;
-        std::cout << "\nВремя выполнения: " << wall.sec() << " c\n";
         return 1;
     }
 
     if (result.empty()) {
-        std::cout << "Маршрут не построен\n";
+        std::cerr << "Маршрут не построен\n";
         delete env;
-        std::cout << "\nВремя выполнения: " << wall.sec() << " c\n";
         return 1;
     }
 
     const double compute_time = wall.sec();
-
-    std::cout << "\nМаршрут (" << result.size() << " точек), формат (y, x, level):\n[";
-    for (size_t i = 0; i < result.size(); ++i) {
-        if (i) std::cout << "\n ";
-        std::cout << "[" << result[i].y << " " << result[i].x << " " << result[i].level << "]";
-    }
-    std::cout << "]\n\n";
 
     const double start_x = route_points.front().second;
     const double start_y = route_points.front().first;
     const double goal_x  = route_points.back().second;
     const double goal_y  = route_points.back().first;
 
-    Timer vis_timer;
-    visualize(env->raw_map, result, start_x, start_y, goal_x, goal_y, "cpp_test.png");
-    const double visualize_time = vis_timer.sec();
+    {
+        NpyArray m = load_npy(env->map_path);
+        Grid2D base_map;
+        base_map.height = (int)m.shape[0];
+        base_map.width  = (int)m.shape[1];
+        base_map.v      = std::move(m.data);
+        visualize(base_map, result, start_x, start_y, goal_x, goal_y, "cpp_test.png");
+    }
 
     delete env;
 
-    std::cout << "\n=============================================\n";
     std::cout << "Время выполнения: " << compute_time << " c\n";
-    std::cout << "  (визуализация, не входит в замер: " << visualize_time << " c)\n";
-    std::cout << "=============================================\n";
     return 0;
 }
