@@ -5,7 +5,6 @@ LIBDIR = astar
 SRC    = $(wildcard $(LIBDIR)/src/*.cpp)
 OBJ    = $(SRC:.cpp=.o)
 LIB    = $(LIBDIR)/libastar.so
-ARGS  ?=
 
 all: $(LIB)
 
@@ -15,10 +14,4 @@ $(LIBDIR)/src/%.o: $(LIBDIR)/src/%.cpp $(wildcard $(LIBDIR)/src/*.hpp) $(wildcar
 $(LIB): $(OBJ)
 	$(CXX) $(CXXFLAGS) -shared -o $@ $(OBJ)
 
-run: $(LIB)
-	python3 run_astar.py $(ARGS)
-
-clean:
-	rm -f $(OBJ) $(LIB)
-
-.PHONY: all run clean
+.PHONY: all
