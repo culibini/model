@@ -28,6 +28,12 @@
 //      ./astar_port <y0> <x0> <y1> <x1> [...]     — свои точки маршрута (y, x)
 //      ./astar_port --threads=8 ...               — число потоков (0 = авто)
 //
+//  Модель ожиданий (см. g_legacy): по умолчанию работают ДВА ИСПРАВЛЕНИЯ
+//  дефектов оригинала — петли ожидания материализуются в геометрию маршрута
+//  (и защищены от разглаживания стадией 2), а кружение оплачивается погодой
+//  реально пролетаемых часов. Флаг --legacy возвращает питон-семантику
+//  бит-в-бит (проверяется md5-регрессией).
+//
 //  Экспериментальные режимы (по умолчанию выключены; результат может
 //  отличаться от питон-эталона — подробности у объявлений g_turbo и далее):
 //      --turbo         честная A*-эвристика: та же стоимость маршрута,
@@ -298,6 +304,15 @@ static bool   g_turbo = false;
 static double g_wastar = 1.0;
 static int    g_lookahead = -1;   // -1 => cfg::LOOKAHEAD_LEVELS
 static int    g_hourlook = -1;    // -1 => штатное значение
+
+// --legacy: воспроизводить питон бит-в-бит, ВКЛЮЧАЯ два исправленных дефекта
+// модели ожидания. По умолчанию (без флага) работают исправления:
+//   1) петли ожидания МАТЕРИАЛИЗУЮТСЯ в геометрию маршрута (витки — реальные
+//      точки, время сжигается самой траекторией; стадия 2 их не разглаживает);
+//   2) кружение оплачивается погодой тех часов, В КОТОРЫЕ реально кружишь,
+//      а не погодой часа, которого ждёшь. Следствие: ждать в опасной зоне
+//      дорого, планировщик сам предпочитает выйти из неё и ждать в чистой.
+static bool g_legacy = false;
 
 static unsigned thread_count() {
     if (g_threads) return g_threads;
@@ -732,10 +747,13 @@ static void generate_candidates(double center_x, double center_y, int num_candid
 }
 
 // smooth_adjust_neighbors_numba
+// frozen (может быть nullptr): помеченные точки — витки ожидания, их
+// сглаживание распрямило бы петлю и стёрло время, поэтому они пропускаются
 static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
                                     const std::vector<double>& path_ys,
                                     int center_index, int points_to_adjust,
                                     const GridBool& valid,
+                                    const uint8_t* frozen,
                                     std::vector<double>& adj_xs,
                                     std::vector<double>& adj_ys) {
     const int n_points = (int)path_xs.size();
@@ -748,6 +766,7 @@ static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
 
     for (int i = start_idx; i <= end_idx; ++i) {
         if (i == center_index) continue;
+        if (frozen && frozen[i]) continue;
 
         int window_start = std::max(1, i - 1);
         int window_end   = std::min(n_points - 2, i + 1);
@@ -783,7 +802,8 @@ static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
 static bool is_candidate_safe(const std::vector<double>& path_xs,
                               const std::vector<double>& path_ys,
                               int center_index, double candidate_x, double candidate_y,
-                              int points_to_adjust, const GridBool& valid) {
+                              int points_to_adjust, const GridBool& valid,
+                              const uint8_t* frozen) {
     const int n_points = (int)path_xs.size();
     const int h = valid.height, w = valid.width;
 
@@ -793,7 +813,7 @@ static bool is_candidate_safe(const std::vector<double>& path_xs,
     temp_ys[center_index] = candidate_y;
 
     std::vector<double> sx, sy;
-    smooth_adjust_neighbors(temp_xs, temp_ys, center_index, points_to_adjust, valid, sx, sy);
+    smooth_adjust_neighbors(temp_xs, temp_ys, center_index, points_to_adjust, valid, frozen, sx, sy);
     temp_xs.swap(sx);
     temp_ys.swap(sy);
 
@@ -1243,8 +1263,132 @@ struct DijkstraRaw {
     std::vector<double> stay;
     std::vector<double> total_dist;
     std::vector<int>    arrays;
+    std::vector<uint8_t> frozen;   // 1 = точка петли ожидания, стадии 2 не трогать
     bool ok = false;
 };
+
+// Исправление п.1: превращает виртуальное ожидание ядра в реальную геометрию.
+// Ядро запоминает петли числом («+2650 px налёта» между соседними точками);
+// здесь этот скачок дистанции разворачивается в настоящие витки: челнок между
+// клеткой входа и её самым безопасным соседом ТЕКУЩЕГО часа (партнёр может
+// меняться от часа к часу вместе с погодой). После этого время маршрута
+// сжигается самой траекторией, пересчёт дистанции из геометрии становится
+// корректным, а формату (y, x, эшелон) не нужна колонка времени.
+// Точки витков помечаются frozen=1 — стадия 2 обязана их не трогать, иначе
+// сглаживание распрямит петли и ожидание снова испарится.
+static void materialize_loiter_loops(DijkstraRaw& r,
+                                     const double* danger_grid,
+                                     const GridBool& validity,
+                                     int grid_w, int grid_h,
+                                     int width, int height,
+                                     int step_size, int num_levels, int max_hours,
+                                     double flight_speed) {
+    const size_t n = r.px.size();
+    r.frozen.assign(n, 0);
+    if (n < 2) return;
+
+    const size_t BLOCK = (size_t)num_levels * max_hours;
+    bool any = false;
+    for (size_t i = 0; i + 1 < n && !any; ++i) {
+        const double geo = hypot2(r.px[i + 1] - r.px[i], r.py[i + 1] - r.py[i]);
+        if (r.total_dist[i + 1] - r.total_dist[i] - geo > 1.0) any = true;
+    }
+    if (!any) return;
+
+    std::vector<double> px, py;
+    std::vector<int> lvl;
+    std::vector<uint8_t> fz;
+    px.push_back(r.px[0]); py.push_back(r.py[0]);
+    lvl.push_back(r.levels[0]); fz.push_back(0);
+
+    const int dx8[8] = {0, 1, 0, -1, 1, 1, -1, -1};
+    const int dy8[8] = {1, 0, -1, 0, 1, -1, 1, -1};
+    long total_loop_points = 0;
+
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const double ax = r.px[i], ay = r.py[i];
+        const double bx = r.px[i + 1], by = r.py[i + 1];
+        const double geo = hypot2(bx - ax, by - ay);
+        const double added = (r.total_dist[i + 1] - r.total_dist[i]) - geo;
+        const int L = r.levels[i + 1];
+
+        if (added <= 1.0) {
+            px.push_back(bx); py.push_back(by); lvl.push_back(L); fz.push_back(0);
+            continue;
+        }
+
+        // приходим в клетку входа — якорь петель
+        px.push_back(bx); py.push_back(by); lvl.push_back(L); fz.push_back(1);
+
+        const int bgx = (int)py_round_i(bx / (double)step_size);
+        const int bgy = (int)py_round_i(by / (double)step_size);
+
+        double dpos = r.total_dist[i] + geo;
+        double rem  = added;
+        while (rem > 1.0) {
+            int h = (int)(dpos / flight_speed);
+            if (h > max_hours - 1) h = max_hours - 1;
+            double chunk = (h >= max_hours - 1)
+                ? rem
+                : std::min(rem, (double)(h + 1) * flight_speed - dpos);
+            if (chunk <= 0.0) chunk = rem;
+
+            // самый безопасный сосед в час h — партнёр по челноку на этот час
+            double best = 1e18, nxr = ax, nyr = ay;
+            for (int d = 0; d < 8; ++d) {
+                const int gx2 = bgx + dx8[d], gy2 = bgy + dy8[d];
+                if (gx2 < 0 || gy2 < 0 || gx2 >= grid_w || gy2 >= grid_h) continue;
+                const int rx = gx2 * step_size, ry = gy2 * step_size;
+                if (rx >= width || ry >= height) continue;
+                if (!validity.at(ry, rx)) continue;
+                const double dv = danger_grid[((size_t)gy2 * grid_w + gx2) * BLOCK +
+                                              (size_t)L * max_hours + h];
+                if (dv < best) { best = dv; nxr = rx; nyr = ry; }
+            }
+
+            const double loop_len = 2.0 * hypot2(nxr - bx, nyr - by);
+            long loops = (long)std::ceil(chunk / loop_len);
+            if (loops < 1) loops = 1;
+            for (long k = 0; k < loops; ++k) {
+                px.push_back(nxr); py.push_back(nyr); lvl.push_back(L); fz.push_back(1);
+                px.push_back(bx);  py.push_back(by);  lvl.push_back(L); fz.push_back(1);
+                total_loop_points += 2;
+            }
+            const double flown = (double)loops * loop_len;
+            dpos += flown;
+            rem  -= flown;
+        }
+    }
+
+    // дистанции/часы/stay пересобираются из ЧИСТОЙ геометрии — теперь она
+    // содержит ожидание, поэтому пересчёт корректен по построению
+    const size_t m = px.size();
+    std::vector<double> td(m, 0.0), st(m, 0.0);
+    std::vector<int> ar(m, 0);
+    for (size_t i = 1; i < m; ++i) {
+        td[i] = td[i - 1] + hypot2(px[i] - px[i - 1], py[i] - py[i - 1]);
+        int h = (int)(td[i] / flight_speed);
+        ar[i] = h > max_hours - 1 ? max_hours - 1 : h;
+        st[i] = (lvl[i] > lvl[i - 1])
+            ? cfg::LEVEL_STAY_MULTIPLIER * (lvl[i] - lvl[i - 1]) : 0.0;
+    }
+
+    {
+        char buf[200];
+        std::snprintf(buf, sizeof(buf),
+                      "Ожидания материализованы: %zu -> %zu точек (+%ld точек петель)",
+                      n, m, total_loop_points);
+        log_info(buf);
+    }
+
+    r.px = std::move(px);
+    r.py = std::move(py);
+    r.levels = std::move(lvl);
+    r.stay = std::move(st);
+    r.total_dist = std::move(td);
+    r.arrays = std::move(ar);
+    r.frozen = std::move(fz);
+}
 
 static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                                        double goal_x, double goal_y,
@@ -1668,25 +1812,55 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                         const double required_distance = (double)target_hour * flight_speed;
                         const double need_extra = required_distance - new_total_distance;
                         if (need_extra > 0.0 && nb_ok) {
-                            // min по 8 соседям взят из предрасчёта — одно чтение
-                            // вместо восьми разбросанных (см. комментарий выше)
-                            const double avg_danger =
-                                0.5 * (total_danger + mn_blk[lvl_off + target_hour]);
-                            const double best_cycle_cost =
-                                2.0 * (avg_danger * danger_weight + lp_step);
+                            if (g_legacy) {
+                                // ПИТОН-СЕМАНТИКА: всё кружение оплачивается
+                                // погодой ЦЕЛЕВОГО часа (того, которого ждём) —
+                                // ожидание под грозой стоит по тарифу «после
+                                // грозы». Плюс квантование циклами с перелётом.
+                                const double avg_danger =
+                                    0.5 * (total_danger + mn_blk[lvl_off + target_hour]);
+                                const double best_cycle_cost =
+                                    2.0 * (avg_danger * danger_weight + lp_step);
 
-                            if (best_cycle_cost < 1e17) {
+                                if (best_cycle_cost < 1e17) {
+                                    loitered = true;
+                                    const long long cycles =
+                                        (long long)std::ceil(need_extra / best_cycle_dist);
+                                    added_cost = cycles * best_cycle_cost;
+                                    new_total_distance += cycles * best_cycle_dist;
+                                    int recomputed_hour =
+                                        (int)py_trunc_i(new_total_distance / flight_speed);
+                                    if (recomputed_hour > max_hours - 1) recomputed_hour = max_hours - 1;
+                                    target_hour = recomputed_hour;
+                                    if (target_hour > hour_idx)
+                                        new_hour_stay = hour_stay_distance * (target_hour - hour_idx);
+                                }
+                            } else {
+                                // ИСПРАВЛЕНО (п.3): каждый отрезок кружения
+                                // оплачивается погодой того часа, в котором он
+                                // реально пролетается. Дистанция берётся ровно
+                                // need_extra — прилетаем точно к границе часа,
+                                // без перелёта и передатировки target_hour.
                                 loitered = true;
-                                const long long cycles =
-                                    (long long)std::ceil(need_extra / best_cycle_dist);
-                                added_cost = cycles * best_cycle_cost;
-                                new_total_distance += cycles * best_cycle_dist;
-                                int recomputed_hour =
-                                    (int)py_trunc_i(new_total_distance / flight_speed);
-                                if (recomputed_hour > max_hours - 1) recomputed_hour = max_hours - 1;
-                                target_hour = recomputed_hour;
-                                if (target_hour > hour_idx)
-                                    new_hour_stay = hour_stay_distance * (target_hour - hour_idx);
+                                double add_c = 0.0;
+                                double dpos  = new_total_distance;
+                                double rem   = need_extra;
+                                while (rem > 1e-9) {
+                                    int h = (int)(dpos / flight_speed);
+                                    if (h > max_hours - 1) h = max_hours - 1;
+                                    double chunk = (h >= max_hours - 1)
+                                        ? rem
+                                        : std::min(rem, (double)(h + 1) * flight_speed - dpos);
+                                    if (chunk <= 0.0) chunk = rem;
+                                    const double avg_h =
+                                        0.5 * (dg_blk[lvl_off + h] + mn_blk[lvl_off + h]);
+                                    add_c += chunk * (avg_h * danger_weight / step_distance
+                                                      + length_penalty);
+                                    dpos += chunk;
+                                    rem  -= chunk;
+                                }
+                                added_cost = add_c;
+                                new_total_distance += need_extra;
                             }
                         }
                     }
@@ -1809,6 +1983,14 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     out.total_dist = std::move(pdist);
     out.arrays = std::move(parr);
     out.ok = true;
+
+    if (g_legacy) {
+        out.frozen.assign(out.px.size(), 0);   // питон: ожидание остаётся виртуальным
+    } else {
+        materialize_loiter_loops(out, danger_grid.data(), validity_cache,
+                                 grid_w, grid_h, width, height,
+                                 step_size, num_levels, max_hours, flight_speed);
+    }
     return out;
 }
 
@@ -1822,17 +2004,23 @@ struct RefinedPath {
     std::vector<double> stay;
     std::vector<double> total_dist;
     std::vector<int>    arrays;
+    std::vector<uint8_t> frozen;   // распространяется с точек петель ожидания
 };
 
 static RefinedPath refine_path_to_goal_with_constraints(
         const std::vector<double>& path_x, const std::vector<double>& path_y,
         const std::vector<int>& path_levels, const std::vector<double>& path_stay,
         const std::vector<double>& path_total, const std::vector<int>& path_arrays,
+        const std::vector<uint8_t>& path_frozen,
         int arrays_count, double goal_x, double goal_y, int goal_level,
         double max_step = 20.0) {
 
     RefinedPath r;
     if (path_x.empty()) return r;
+
+    auto fz = [&](size_t i) -> uint8_t {
+        return i < path_frozen.size() ? path_frozen[i] : 0;
+    };
 
     // [BUG 1] В оригинале аргументы distance_to_hour_index идут в неверном
     // порядке: (dist, FLIGHT_SPEED, HOURS_PER_ARRAY_SLICE, arrays_count),
@@ -1852,6 +2040,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
     r.stay.push_back(path_stay[0]);
     r.total_dist.push_back(path_total[0]);
     r.arrays.push_back(path_arrays[0]);
+    r.frozen.push_back(fz(0));
 
     for (size_t i = 0; i + 1 < path_x.size(); ++i) {
         const double sx = path_x[i],  sy = path_y[i];
@@ -1868,6 +2057,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
             r.stay.push_back(end_stay);
             r.total_dist.push_back(end_dist);
             r.arrays.push_back(path_arrays[i + 1]);
+            r.frozen.push_back(fz(i + 1));
         } else {
             const int num_steps = std::max(2, (int)py_trunc_i(segment_length / max_step) + 1);
             for (int step = 1; step < num_steps; ++step) {
@@ -1899,12 +2089,15 @@ static RefinedPath refine_path_to_goal_with_constraints(
                 r.stay.push_back(interpolated_stay);
                 r.total_dist.push_back(interpolated_dist);
                 r.arrays.push_back(buggy_hour(interpolated_dist));
+                // точка внутри отрезка петли заморожена, если оба конца заморожены
+                r.frozen.push_back(fz(i) && fz(i + 1) ? 1 : 0);
             }
             r.xs.push_back(ex); r.ys.push_back(ey);
             r.levels.push_back(end_lvl);
             r.stay.push_back(end_stay);
             r.total_dist.push_back(end_dist);
             r.arrays.push_back(path_arrays[i + 1]);
+            r.frozen.push_back(fz(i + 1));
         }
     }
 
@@ -1926,9 +2119,11 @@ static RefinedPath refine_path_to_goal_with_constraints(
             r.stay.push_back(interpolated_stay);
             r.total_dist.push_back(interpolated_dist);
             r.arrays.push_back(buggy_hour(interpolated_dist));
+            r.frozen.push_back(0);
         }
     }
 
+    r.frozen.push_back(0);   // сама цель не заморожена
     r.xs.push_back(goal_x); r.ys.push_back(goal_y);
     r.levels.push_back(goal_level);
     const size_t k = r.xs.size();
@@ -2097,7 +2292,7 @@ static int find_optimal_level_with_constraints(double px, double py, int current
 static void generate_safe_candidates(const std::vector<double>& path_xs,
                                      const std::vector<double>& path_ys,
                                      int center_index, double cur_x, double cur_y,
-                                     Environment& env,
+                                     Environment& env, const uint8_t* frozen,
                                      std::vector<double>& out_x, std::vector<double>& out_y) {
     out_x.clear();
     out_y.clear();
@@ -2126,7 +2321,8 @@ static void generate_safe_candidates(const std::vector<double>& path_xs,
 
     for (size_t i = 0; i < cx.size(); ++i) {
         if (is_candidate_safe(path_xs, path_ys, center_index, cx[i], cy[i],
-                              cfg::POINTS_TO_ADJUST, env.map2_cache->validity_cache)) {
+                              cfg::POINTS_TO_ADJUST, env.map2_cache->validity_cache,
+                              frozen)) {
             out_x.push_back(cx[i]);
             out_y.push_back(cy[i]);
         }
@@ -2150,7 +2346,17 @@ static OptimizeResult optimize_path_with_fixed_weights(
         const std::vector<double>& init_xs, const std::vector<double>& init_ys,
         const std::vector<int>& init_levels, const std::vector<double>& init_stay,
         const std::vector<double>& init_total, const std::vector<int>& init_arr,
-        const Weights& w, Environment& env) {
+        const std::vector<uint8_t>& frozen_pts, const Weights& w, Environment& env) {
+
+    const uint8_t* frozen =
+        frozen_pts.size() == init_xs.size() ? frozen_pts.data() : nullptr;
+    {
+        size_t nfz = 0;
+        for (uint8_t f : frozen_pts) nfz += f;
+        if (nfz > 0)
+            log_info("Заморожено точек ожидания (стадия 2 их не трогает): " +
+                     std::to_string(nfz));
+    }
 
     log_info("Launching path optimization with fixed weights");
     {
@@ -2208,6 +2414,8 @@ static OptimizeResult optimize_path_with_fixed_weights(
         double best_fitness = fitness_of(path_xs, path_ys, path_levels, path_total_distances);
 
         for (int i = 1; i < n_points - 1; ++i) {
+            if (frozen && frozen[i]) continue;   // витки ожидания не двигаем
+
             const double cur_x = path_xs[i], cur_y = path_ys[i];
             const int    current_level = path_levels[i];
             const double current_level_distance = lvl_dist[i];
@@ -2216,7 +2424,8 @@ static OptimizeResult optimize_path_with_fixed_weights(
             int    best_level = current_level;
 
             std::vector<double> cand_x, cand_y;
-            generate_safe_candidates(path_xs, path_ys, i, cur_x, cur_y, env, cand_x, cand_y);
+            generate_safe_candidates(path_xs, path_ys, i, cur_x, cur_y, env, frozen,
+                                     cand_x, cand_y);
             if (is_point_and_neighbors_safe(path_xs, path_ys, i, cur_x, cur_y,
                                             env.map2_cache->validity_cache)) {
                 cand_x.push_back(cur_x);
@@ -2238,7 +2447,8 @@ static OptimizeResult optimize_path_with_fixed_weights(
                     tx[i] = cand_x[c];
                     ty[i] = cand_y[c];
                     smooth_adjust_neighbors(tx, ty, i, cfg::POINTS_TO_ADJUST,
-                                            env.map2_cache->validity_cache, sx, sy);
+                                            env.map2_cache->validity_cache, frozen,
+                                            sx, sy);
 
                     double* __restrict dx = &cand_tx[c * n_points];
                     double* __restrict dy = &cand_ty[c * n_points];
@@ -2285,7 +2495,7 @@ static OptimizeResult optimize_path_with_fixed_weights(
 
             std::vector<double> sx, sy;
             smooth_adjust_neighbors(path_xs, path_ys, i, cfg::POINTS_TO_ADJUST,
-                                    env.map2_cache->validity_cache, sx, sy);
+                                    env.map2_cache->validity_cache, frozen, sx, sy);
             path_xs.swap(sx);
             path_ys.swap(sy);
 
@@ -2412,7 +2622,7 @@ static SegmentResult run_segment_pipeline(int segment_idx,
 
     RefinedPath ref = refine_path_to_goal_with_constraints(
         raw.px, raw.py, raw.levels, raw.stay, raw.total_dist, raw.arrays,
-        (int)env.arrays_3d.size(), ex, ey, goal_level);
+        raw.frozen, (int)env.arrays_3d.size(), ex, ey, goal_level);
 
     analyze_array_usage(ref.arrays, (int)env.arrays_3d.size());
     check_stay_requirements(ref.levels, ref.stay);
@@ -2442,7 +2652,7 @@ static SegmentResult run_segment_pipeline(int segment_idx,
     log_info("Stage 2: Path optimization with fixed weights");
     OptimizeResult opt = optimize_path_with_fixed_weights(
         res.d_xs, res.d_ys, res.d_levels, res.d_stay, res.d_total, res.d_arr,
-        fixed_weights, env);
+        ref.frozen, fixed_weights, env);
 
     res.o_xs = std::move(opt.xs);
     res.o_ys = std::move(opt.ys);
@@ -2850,12 +3060,19 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a.rfind("--threads=", 0) == 0) g_threads = (unsigned)std::atoi(a.c_str() + 10);
+        else if (a == "--legacy") g_legacy = true;
         else if (a == "--turbo") g_turbo = true;
         else if (a.rfind("--wastar=", 0) == 0) { g_turbo = true; g_wastar = std::atof(a.c_str() + 9); }
         else if (a.rfind("--lookahead=", 0) == 0) g_lookahead = std::atoi(a.c_str() + 12);
         else if (a.rfind("--hourlook=", 0) == 0) g_hourlook = std::atoi(a.c_str() + 11);
         else pos.push_back(a);
     }
+    if (g_legacy)
+        log_info("РЕЖИМ LEGACY: питон-семантика ожиданий (петли виртуальны, "
+                 "кружение по цене целевого часа) — бит-в-бит как оригинал");
+    else
+        log_info("Модель ожиданий: исправленная (петли в геометрии, кружение "
+                 "по погоде реальных часов). Питон-поведение: --legacy");
     if (g_turbo) {
         char buf[400];
         std::snprintf(buf, sizeof(buf),
