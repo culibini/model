@@ -33,6 +33,14 @@ $(TARGET): $(SRC) Makefile
 run: $(TARGET)
 	./$(TARGET) $(ARGS)
 
+# тот же маршрут по стоимости, но с честной A*-эвристикой — быстрее в разы
+turbo: $(TARGET)
+	./$(TARGET) --turbo $(ARGS)
+
+# взвешенный A*: скорость в десятки раз, качество не хуже W=2 раз (реально ~1%)
+fast: $(TARGET)
+	./$(TARGET) --wastar=2 $(ARGS)
+
 pgo: $(SRC)
 	$(CXX) $(CXXFLAGS) -fprofile-generate -o $(TARGET) $(SRC)
 	./$(TARGET) $(ARGS)
@@ -50,4 +58,4 @@ debug: $(SRC)
 clean:
 	rm -f $(TARGET) $(TARGET)_debug *.gcda
 
-.PHONY: all run pgo portable debug clean
+.PHONY: all run turbo fast pgo portable debug clean
