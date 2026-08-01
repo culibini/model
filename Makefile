@@ -12,10 +12,11 @@ all: $(LIB)
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(BUILDDIR)/%.o: $(LIBDIR)/src/%.cpp $(wildcard $(LIBDIR)/src/*.hpp) $(wildcard $(LIBDIR)/include/astar/*.hpp) Makefile | $(BUILDDIR)
+$(BUILDDIR)/%.o: $(LIBDIR)/src/%.cpp | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) -I$(LIBDIR)/include -I$(LIBDIR)/src -c $< -o $@
 
 $(LIB): $(OBJ)
 	$(CXX) $(CXXFLAGS) -shared -o $@ $(OBJ)
+	rm -rf $(BUILDDIR)
 
 .PHONY: all
