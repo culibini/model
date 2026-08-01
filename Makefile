@@ -1,18 +1,10 @@
-# Сборка и запуск порта astar.
-#
-#   make              — собрать оптимизированный ./astar_port
-#   make run          — собрать и запустить с маршрутом по умолчанию
-#   make run ARGS="3000 3850 1500 1500"
-#                     — свои точки (парами y x), можно добавить --threads=N
-#   make pgo          — сборка с profile-guided optimization: компиляция с
-#                       профилировкой, тренировочный прогон (нужна data/!),
-#                       пересборка по собранному профилю. Даёт обычно 5-15%.
-#   make portable     — без -march=native: бинарник можно переносить на
-#                       другие машины (без AVX2 под конкретный процессор)
-#   make debug        — отладочная сборка с санитайзерами (./astar_port_debug)
-#   make clean
-#
-# Windows: работает с MinGW (mingw32-make) и в WSL как есть.
+# make              - собрать ./astar_port
+# make run          - собрать и запустить; точки: make run ARGS="3000 3850 1500 1500"
+#                     доп. флаги: --wastar=W (скорость за счёт качества), --threads=N
+# make pgo          - сборка с profile-guided optimization (нужна data/ рядом)
+# make portable     - без -march=native, бинарник переносим между машинами
+# make debug        - отладочная сборка с санитайзерами
+# make clean
 
 CXX      ?= g++
 STD       = -std=c++17
@@ -33,14 +25,6 @@ $(TARGET): $(SRC) Makefile
 run: $(TARGET)
 	./$(TARGET) $(ARGS)
 
-# тот же маршрут по стоимости, но с честной A*-эвристикой — быстрее в разы
-turbo: $(TARGET)
-	./$(TARGET) --turbo $(ARGS)
-
-# взвешенный A*: скорость в десятки раз, качество не хуже W=2 раз (реально ~1%)
-fast: $(TARGET)
-	./$(TARGET) --wastar=2 $(ARGS)
-
 pgo: $(SRC)
 	$(CXX) $(CXXFLAGS) -fprofile-generate -o $(TARGET) $(SRC)
 	./$(TARGET) $(ARGS)
@@ -58,4 +42,4 @@ debug: $(SRC)
 clean:
 	rm -f $(TARGET) $(TARGET)_debug *.gcda
 
-.PHONY: all run turbo fast pgo portable debug clean
+.PHONY: all run pgo portable debug clean

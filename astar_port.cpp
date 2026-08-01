@@ -1,84 +1,3 @@
-// =============================================================================
-//  astar_port.cpp — построчный порт python-пакета `astar` на C++ (один файл).
-//
-//  Что делает: строит маршрут в пространстве (x, y, эшелон, час) по карте
-//  опасности и почасовым 3D-прогнозам, затем локально оптимизирует его,
-//  рисует результат в cpp_test.png и печатает время выполнения.
-//
-//  Ожидаемая раскладка рядом с бинарником:
-//      ./data/map-test.npy      — 2D карта опасности
-//      ./data/0h.npy ... 9h.npy — 3D прогнозы (level, y, x)
-//
-//  Сборка — просто `make` (рядом лежит Makefile):
-//
-//      make            собрать ./astar_port
-//      make run        собрать и запустить (точки: make run ARGS="...")
-//      make pgo        двухпроходная сборка с profile-guided optimization
-//
-//  Вручную (эквивалент make):
-//      g++ -O3 -march=native -fopenmp -pthread -std=c++17 -o astar_port astar_port.cpp
-//  Флаги обязательны: без -O это в разы медленнее питона (numba свои ядра
-//  компилирует с оптимизацией, а тут компилятор ничего не делает).
-//  -fopenmp опционален (без него — фолбэк на std::thread, чуть медленнее
-//  стадия 2). Опционально -ffp-contract=off: запрещает схлопывать a*b+c в
-//  FMA, чтобы результат не зависел от машины сборки; стоит ~12% скорости.
-//
-//  Запуск:
-//      ./astar_port
-//      ./astar_port <y0> <x0> <y1> <x1> [...]     — свои точки маршрута (y, x)
-//      ./astar_port --threads=8 ...               — число потоков (0 = авто)
-//
-//  Модель ожиданий (см. g_legacy): по умолчанию работают ДВА ИСПРАВЛЕНИЯ
-//  дефектов оригинала — петли ожидания материализуются в геометрию маршрута
-//  (и защищены от разглаживания стадией 2), а кружение оплачивается погодой
-//  реально пролетаемых часов. Флаг --legacy возвращает питон-семантику
-//  бит-в-бит (проверяется md5-регрессией).
-//
-//  Экспериментальные режимы (по умолчанию выключены; результат может
-//  отличаться от питон-эталона — подробности у объявлений g_turbo и далее):
-//      --turbo         честная A*-эвристика: та же стоимость маршрута,
-//                      быстрее в разы (на тестах 2-8x)
-//      --wastar=W      взвешенный A*: маршрут не хуже W раз по стоимости;
-//                      W=2..3 даёт десятки раз по скорости при единицах
-//                      процентов по качеству
-//      --lookahead=N   ограничить скачок по эшелонам за шаг (штатно 10)
-//      --hourlook=N    ограничить намеренный сдвиг часа за шаг (штатно 9)
-//
-//  Заодно программа теперь предупреждает о переполнении кучи поиска
-//  (унаследованном от питона): при переполнении пуши молча выбрасываются и
-//  найденный маршрут может быть хуже оптимального. На маленьких картах это
-//  реально происходит — turbo-режим свободен от этого эффекта.
-//
-//  ОПТИМИЗАЦИИ (все сохраняют побитово тот же маршрут):
-//    * Плоская память: всё 4D-пространство (x, y, эшелон, час) — сплошные
-//      одномерные буферы, индекс считается арифметикой. Никаких
-//      vector<vector<>>, никаких узлов-аллокаций. Порядок осей выбран так,
-//      что самый внутренний цикл (по часам) идёт по соседним адресам.
-//    * calloc/malloc вместо value-initialization: np.zeros в питоне отдаёт
-//      ленивые нулевые страницы, а std::vector<T>(n) честно memset-ит гигабайты.
-//    * Плоская хеш-таблица с открытой адресацией вместо std::unordered_map
-//      (аналог absl::flat_hash_map, но без внешней зависимости).
-//    * Предрасчёт минимума опасности по 8 соседям: 8 разбросанных чтений в
-//      самом горячем месте -> одно последовательное.
-//    * Многопоточность на проходах, где порядок не влияет на результат.
-//    * Ранний выход из часового цикла там, где оставшиеся итерации доказуемо
-//      холостые.
-//  Сам цикл Дейкстры остаётся однопоточным: порядок извлечения из кучи
-//  определяет prev_grid, а с ним и маршрут.
-//
-//  ВАЖНО про соответствие питону:
-//    * Логика перенесена 1:1, ВКЛЮЧАЯ известные баги оригинала. Они помечены
-//      комментариями [BUG N]. Их «исправление» изменило бы маршрут.
-//    * Стадия 2 в питоне использует np.random без сида, т.е. питон-версия
-//      недетерминирована и даёт разный маршрут на каждом запуске. Здесь
-//      воспроизведён генератор NumPy/numba (MT19937 + legacy rk_gauss) с
-//      фиксированным сидом RNG_SEED, поэтому C++ детерминирован. Чтобы
-//      получить совпадение с питоном, надо в питоне добавить
-//      np.random.seed(RNG_SEED) внутри njit-функции generate_candidates_numba.
-//    * round() везде — питоновский round-half-to-even (std::nearbyint),
-//      а не C-шный round-half-away-from-zero.
-// =============================================================================
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -110,9 +29,6 @@
 #include <sys/mman.h>
 #endif
 
-// =============================================================================
-//  config.py
-// =============================================================================
 namespace cfg {
 
 constexpr double LENGTH_WEIGHT         = 1.0;
@@ -145,15 +61,14 @@ constexpr double DANGER_HYPERBOLIC_SCALE = 1000.0;
 
 constexpr double FLIGHT_SPEED            = 1000.0;
 constexpr double HOURS_PER_ARRAY_SLICE   = 1.0;
-// HOUR_LOOKAHEAD = None  ->  get_hour_lookahead_value() вернёт max_hours - 1
+
 constexpr bool   HOUR_LOOKAHEAD_IS_NONE  = true;
-constexpr int    HOUR_LOOKAHEAD_VALUE    = 0;   // не используется пока IS_NONE
-constexpr double HOUR_STAY_DISTANCE      = FLIGHT_SPEED * 0.25;   // 250
+constexpr int    HOUR_LOOKAHEAD_VALUE    = 0;
+constexpr double HOUR_STAY_DISTANCE      = FLIGHT_SPEED * 0.25;
 constexpr double HOUR_SWITCH_PENALTY     = 25.0;
 
 constexpr long long MAX_NODES            = 35000000LL;
 
-// LEVEL_PENALTIES / LEVEL_PENALTIES_ARRAY
 static const double LEVEL_PENALTIES[NUM_LEVELS] = {
     10, 10,  5,  0,  0,  0,  0,  0,  0,  0,
      0,  0,  0,  0,  0,  0,  0,  0,  0,  5,
@@ -161,53 +76,24 @@ static const double LEVEL_PENALTIES[NUM_LEVELS] = {
     60, 60
 };
 
-// сид для генератора кандидатов (в питоне сида нет вовсе)
 constexpr uint32_t RNG_SEED = 12345u;
 
-} // namespace cfg
-
-// =============================================================================
-//  Мелкие хелперы
-// =============================================================================
-
-// Python round(): половина округляется к чётному. std::nearbyint при
-// стандартном режиме FE_TONEAREST делает ровно это.
-static inline double py_round(double x) { return std::nearbyint(x); }
-static inline long   py_round_i(double x) { return (long)std::nearbyint(x); }
-// Python int(): усечение к нулю
-static inline long   py_trunc_i(double x) { return (long)std::trunc(x); }
-
-// std::hypot корректно округлён, но в glibc он в 10-30 раз медленнее sqrt.
-// На пиксельных координатах (|v| < 1e5) переполнения быть не может, поэтому по
-// умолчанию используем быстрый вариант. Соберите с -DEXACT_HYPOT, если нужен
-// именно std::hypot.
-static inline double hypot2(double dx, double dy) {
-#ifdef EXACT_HYPOT
-    return std::hypot(dx, dy);
-#else
-    return std::sqrt(dx * dx + dy * dy);
-#endif
 }
 
-// Буфер с семантикой numpy-аллокаций:
-//   zeros() — calloc: ОС отдаёт нулевые страницы лениво, физической записи нет
-//             (это то, что делает np.zeros; std::vector<T>(n) вместо этого
-//              честно memset-ит гигабайты)
-//   uninit() — malloc без инициализации (это np.empty)
-//   filled() — malloc + fill (это np.full)
-// Большие буферы берутся через mmap, а не malloc, по трём причинам:
-//   * страницы нулевые и выдаются лениво (как np.zeros, без физического memset);
-//   * адрес выровнен по странице, значит к нему применим madvise;
-//   * MADV_HUGEPAGE переводит буфер на страницы по 2 МБ. При рабочем наборе в
-//     сотни мегабайт это решающе: с обычными страницами по 4 КБ таблица
-//     трансляции не влезает в TLB (полторы тысячи записей против сотен тысяч
-//     нужных), и почти каждое случайное обращение платит лишний поход в память
-//     ещё до чтения самих данных.
+static inline double py_round(double x) { return std::nearbyint(x); }
+static inline long   py_round_i(double x) { return (long)std::nearbyint(x); }
+
+static inline long   py_trunc_i(double x) { return (long)std::trunc(x); }
+
+static inline double hypot2(double dx, double dy) {
+    return std::sqrt(dx * dx + dy * dy);
+}
+
 template <typename T>
 struct Buf {
     T* p = nullptr;
     size_t n = 0;
-    size_t map_bytes = 0;             // != 0 => выделено через mmap
+    size_t map_bytes = 0;
 
     static constexpr size_t BIG_THRESHOLD = 8u << 20;
 
@@ -230,12 +116,12 @@ struct Buf {
 
     bool map_big(size_t bytes) {
 #ifdef __linux__
-        const size_t HP = (size_t)1 << 21;             // 2 МБ
+        const size_t HP = (size_t)1 << 21;
         const size_t rounded = (bytes + HP - 1) / HP * HP;
         void* q = ::mmap(nullptr, rounded, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (q == MAP_FAILED) return false;
-#if defined(MADV_HUGEPAGE) && !defined(ASTAR_NO_HUGEPAGE)
+#ifdef MADV_HUGEPAGE
         ::madvise(q, rounded, MADV_HUGEPAGE);
 #endif
         p = (T*)q;
@@ -274,45 +160,9 @@ struct Buf {
     inline const T* data() const { return p; }
 };
 
-// -----------------------------------------------------------------------------
-//  Многопоточность
-// -----------------------------------------------------------------------------
-// Параллелятся только те проходы, где порядок выполнения не влияет на результат:
-// предрасчёты (каждый поток пишет свои строки) и оценка кандидатов на стадии 2
-// (чистая функция от неизменяемых данных). Сам цикл Дейкстры остаётся
-// однопоточным: порядок извлечения из кучи определяет prev_grid, а значит и
-// маршрут — распараллелить его без изменения результата нельзя.
-static unsigned g_threads = 0;   // 0 => hardware_concurrency
+static unsigned g_threads = 0;
 
-// ---------------------------------------------------------------------------
-//  Экспериментальные режимы (все выключены по умолчанию — без флагов
-//  программа побитово повторяет питон):
-//
-//  --turbo       нормальная допустимая эвристика A* вместо штатной заниженной.
-//                Строится проекцией задачи на 2D: для каждой клетки берём
-//                минимум опасности по всем эшелонам и часам, затем обратной
-//                Дейкстрой от цели считаем нижнюю оценку остаточной стоимости.
-//                Оценка допустима и консистентна => найденный маршрут имеет
-//                ТУ ЖЕ оптимальную стоимость, но среди равноценных маршрутов
-//                может быть выбран другой (побитовость не гарантируется).
-//  --wastar=W    взвешенный A*: приоритет = cost + W*h. W>1 жертвует
-//                оптимальностью (не хуже W раз), режет поиск ещё сильнее.
-//  --lookahead=N максимальный скачок по эшелонам за шаг (штатно 10).
-//  --hourlook=N  максимальный намеренный сдвиг часа за шаг (штатно 9).
-// ---------------------------------------------------------------------------
-static bool   g_turbo = false;
 static double g_wastar = 1.0;
-static int    g_lookahead = -1;   // -1 => cfg::LOOKAHEAD_LEVELS
-static int    g_hourlook = -1;    // -1 => штатное значение
-
-// --legacy: воспроизводить питон бит-в-бит, ВКЛЮЧАЯ два исправленных дефекта
-// модели ожидания. По умолчанию (без флага) работают исправления:
-//   1) петли ожидания МАТЕРИАЛИЗУЮТСЯ в геометрию маршрута (витки — реальные
-//      точки, время сжигается самой траекторией; стадия 2 их не разглаживает);
-//   2) кружение оплачивается погодой тех часов, В КОТОРЫЕ реально кружишь,
-//      а не погодой часа, которого ждёшь. Следствие: ждать в опасной зоне
-//      дорого, планировщик сам предпочитает выйти из неё и ждать в чистой.
-static bool g_legacy = false;
 
 static unsigned thread_count() {
     if (g_threads) return g_threads;
@@ -324,11 +174,6 @@ static unsigned thread_count() {
 #endif
 }
 
-// При сборке с -fopenmp используется персистентный пул потоков OpenMP —
-// потоки создаются один раз, а не на каждый вызов (это важно на стадии 2,
-// где parallel_for дёргается тысячи раз). Без OpenMP — фолбэк на std::thread.
-// Разбиение static детерминировано, но параллелятся только участки, где
-// порядок вычислений не влияет на результат.
 template <typename F>
 static void parallel_for(size_t begin, size_t end, F&& body) {
     if (end <= begin) return;
@@ -361,15 +206,9 @@ static void parallel_for(size_t begin, size_t end, F&& body) {
 #endif
 }
 
-// -----------------------------------------------------------------------------
-//  Плоская хеш-таблица (открытая адресация, линейное пробирование)
-// -----------------------------------------------------------------------------
-// Замена std::unordered_map: вся таблица — один сплошной кусок памяти, без
-// цепочек и без узлов-аллокаций. То же, что даёт absl::flat_hash_map, но без
-// внешней зависимости (файл должен остаться самодостаточным).
 struct FlatDangerMap {
     struct Slot {
-        uint64_t key;      // EMPTY / TOMB — служебные
+        uint64_t key;
         double   danger;
         int32_t  hour;
     };
@@ -378,12 +217,12 @@ struct FlatDangerMap {
 
     std::vector<Slot> slots;
     size_t mask = 0;
-    size_t live = 0;      // занятых
-    size_t used = 0;      // занятых + надгробий
+    size_t live = 0;
+    size_t used = 0;
 
     FlatDangerMap() { rehash(1u << 20); }
 
-    static inline uint64_t mix(uint64_t x) {   // splitmix64
+    static inline uint64_t mix(uint64_t x) {
         x += 0x9E3779B97F4A7C15ull;
         x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
         x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
@@ -457,13 +296,9 @@ static void log_info(const std::string& s)  { std::cout << "[INFO ] " << s << "\
 static void log_warn(const std::string& s)  { std::cout << "[WARN ] " << s << "\n"; }
 static void log_error(const std::string& s) { std::cout << "[ERROR] " << s << "\n"; }
 
-// =============================================================================
-//  Загрузка .npy (C-order, little-endian)
-// =============================================================================
-
 struct NpyArray {
     std::vector<size_t> shape;
-    std::vector<double> data;   // всегда конвертируем в float64, как .astype(np.float64)
+    std::vector<double> data;
 
     size_t size() const {
         size_t n = 1;
@@ -502,7 +337,6 @@ static NpyArray load_npy(const std::string& path) {
     std::string header(header_len, '\0');
     f.read(&header[0], header_len);
 
-    // descr
     auto grab_quoted = [&](const std::string& key) -> std::string {
         size_t k = header.find(key);
         if (k == std::string::npos) return "";
@@ -521,7 +355,6 @@ static NpyArray load_npy(const std::string& path) {
     if (fortran)
         throw std::runtime_error("ValueError: fortran_order .npy is not supported: " + path);
 
-    // shape
     NpyArray out;
     {
         size_t k = header.find("'shape'");
@@ -540,7 +373,6 @@ static NpyArray load_npy(const std::string& path) {
     size_t n = out.size();
     out.data.resize(n);
 
-    // нормализуем descr: убираем ведущий '<', '=', '|'
     std::string d = descr;
     if (!d.empty() && (d[0] == '<' || d[0] == '=' || d[0] == '|' || d[0] == '>')) {
         if (d[0] == '>' && d.size() > 2 && d[2] != '1')
@@ -606,10 +438,6 @@ static NpyArray load_npy(const std::string& path) {
     return out;
 }
 
-// =============================================================================
-//  ГСЧ NumPy legacy (MT19937 + rk_double + rk_gauss), как в numba
-// =============================================================================
-
 struct NumpyRandom {
     std::mt19937 mt;
     bool   has_gauss = false;
@@ -617,14 +445,12 @@ struct NumpyRandom {
 
     void seed(uint32_t s) { mt.seed(s); has_gauss = false; cached_gauss = 0.0; }
 
-    // rk_double
     double random() {
         uint32_t a = mt() >> 5;
         uint32_t b = mt() >> 6;
         return (a * 67108864.0 + b) / 9007199254740992.0;
     }
 
-    // rk_gauss (полярный метод Марсальи с кэшем второго значения)
     double gauss() {
         if (has_gauss) {
             double t = cached_gauss;
@@ -649,11 +475,6 @@ struct NumpyRandom {
 
 static NumpyRandom g_rng;
 
-// =============================================================================
-//  calculations.py — numba-ядра
-// =============================================================================
-
-// _map_to_3d_coords_numba
 static inline void map_to_3d_coords(double x, double y, double scale_x, double scale_y,
                                     int max_x3d, int max_y3d, int& x3d, int& y3d) {
     long xi = py_trunc_i(x / scale_x);
@@ -666,7 +487,6 @@ static inline void map_to_3d_coords(double x, double y, double scale_x, double s
     y3d = (int)yi;
 }
 
-// 2D-карты храним плоско: idx = y * width + x
 struct Grid2D {
     int width = 0, height = 0;
     std::vector<double> v;
@@ -680,7 +500,6 @@ struct GridBool {
     inline uint8_t at(int y, int x) const { return v[(size_t)y * width + x]; }
 };
 
-// _line_clear_numba
 static bool line_clear(double x1, double y1, double x2, double y2, const GridBool& valid) {
     long x1i = py_round_i(x1), y1i = py_round_i(y1);
     long x2i = py_round_i(x2), y2i = py_round_i(y2);
@@ -714,7 +533,6 @@ static bool line_clear(double x1, double y1, double x2, double y2, const GridBoo
     return valid.at((int)y2i, (int)x2i) != 0;
 }
 
-// generate_candidates_numba
 static void generate_candidates(double center_x, double center_y, int num_candidates,
                                 int max_attempts, double radius, double width, double height,
                                 bool use_direction, double dir_x, double dir_y,
@@ -725,7 +543,7 @@ static void generate_candidates(double center_x, double center_y, int num_candid
     while ((int)cx_out.size() < num_candidates && attempts < max_attempts) {
         attempts++;
         double angle, r;
-        // ВНИМАНИЕ: короткое замыкание — random() дёргается только если use_direction
+
         if (use_direction && g_rng.random() < 0.7) {
             double angle_variation = g_rng.normal(0.0, 0.5);
             double base_angle = std::atan2(dir_y, dir_x);
@@ -746,9 +564,6 @@ static void generate_candidates(double center_x, double center_y, int num_candid
     }
 }
 
-// smooth_adjust_neighbors_numba
-// frozen (может быть nullptr): помеченные точки — витки ожидания, их
-// сглаживание распрямило бы петлю и стёрло время, поэтому они пропускаются
 static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
                                     const std::vector<double>& path_ys,
                                     int center_index, int points_to_adjust,
@@ -773,7 +588,6 @@ static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
         int count = 0;
         double sum_x = 0.0, sum_y = 0.0;
 
-        // среднее берётся по ИСХОДНОМУ пути, а проверки — по уже правленному
         for (int j = window_start; j <= window_end; ++j) {
             sum_x += path_xs[j];
             sum_y += path_ys[j];
@@ -798,7 +612,6 @@ static void smooth_adjust_neighbors(const std::vector<double>& path_xs,
     }
 }
 
-// is_candidate_safe_numba
 static bool is_candidate_safe(const std::vector<double>& path_xs,
                               const std::vector<double>& path_ys,
                               int center_index, double candidate_x, double candidate_y,
@@ -833,7 +646,6 @@ static bool is_candidate_safe(const std::vector<double>& path_xs,
     return true;
 }
 
-// is_point_and_neighbors_safe_numba
 static bool is_point_and_neighbors_safe(const std::vector<double>& path_xs,
                                         const std::vector<double>& path_ys,
                                         int center_index, double point_x, double point_y,
@@ -858,7 +670,6 @@ static bool is_point_and_neighbors_safe(const std::vector<double>& path_xs,
     return true;
 }
 
-// recalculate_distances_numba
 static std::vector<double> recalculate_distances(const std::vector<double>& xs,
                                                  const std::vector<double>& ys) {
     const size_t n = xs.size();
@@ -868,7 +679,6 @@ static std::vector<double> recalculate_distances(const std::vector<double>& xs,
     return out;
 }
 
-// level_distances_numba
 static std::vector<double> level_distances(const std::vector<double>& xs,
                                            const std::vector<double>& ys,
                                            const std::vector<int>& levels) {
@@ -883,7 +693,6 @@ static std::vector<double> level_distances(const std::vector<double>& xs,
     return out;
 }
 
-// recompute_stay_requirements_numba
 static std::vector<double> recompute_stay_requirements(const std::vector<int>& levels) {
     const size_t n = levels.size();
     std::vector<double> out(n, 0.0);
@@ -896,14 +705,10 @@ static std::vector<double> recompute_stay_requirements(const std::vector<int>& l
     return out;
 }
 
-// =============================================================================
-//  cache/danger_map_cache.py — DangerMapCache
-// =============================================================================
-
 struct DangerMapCache {
     int width = 0, height = 0;
-    Grid2D  danger_cache;    // после гиперболического штрафа
-    GridBool validity_cache; // np.ones_like -> всегда 1
+    Grid2D  danger_cache;
+    GridBool validity_cache;
 
     explicit DangerMapCache(const Grid2D& danger_map_2d) {
         height = danger_map_2d.height;
@@ -930,8 +735,6 @@ struct DangerMapCache {
         }
         if (!any) return base;
 
-        // поэлементный проход без редукций — векторизуется под AVX2 и делится
-        // по строкам между потоками без влияния на результат
         const double cap = cfg::DANGER_HYPERBOLIC_RANGE * 0.999999;
         double* __restrict p = base.v.data();
         const int W = base.width;
@@ -949,11 +752,10 @@ struct DangerMapCache {
         return base;
     }
 
-    // is_valid_fast_numba: только проверка границ (danger_cache игнорируется)
     inline bool is_valid_fast(long x, long y) const {
         return !(x < 0 || x >= width || y < 0 || y >= height);
     }
-    // get_danger_fast_numba
+
     inline double get_danger_fast(long x, long y) const {
         if (x < 0 || x >= width || y < 0 || y >= height) return 1e9;
         return danger_cache.at((int)y, (int)x);
@@ -966,13 +768,6 @@ struct DangerMapCache {
     }
 };
 
-// =============================================================================
-//  utils.distance_to_hour_index
-// =============================================================================
-
-// def distance_to_hour_index(distance_traveled, arrays_count,
-//                            flight_speed=FLIGHT_SPEED,
-//                            hours_per_array_slice=HOURS_PER_ARRAY_SLICE)
 static inline double distance_to_hour_index(double distance_traveled, double arrays_count,
                                             double flight_speed = cfg::FLIGHT_SPEED,
                                             double hours_per_array_slice = cfg::HOURS_PER_ARRAY_SLICE) {
@@ -983,15 +778,10 @@ static inline double distance_to_hour_index(double distance_traveled, double arr
     return ((double)hour_idx <= max_idx) ? (double)hour_idx : max_idx;
 }
 
-// get_hour_lookahead_value
 static inline int get_hour_lookahead_value(int max_hours) {
     if (cfg::HOUR_LOOKAHEAD_IS_NONE) return max_hours > 0 ? max_hours - 1 : 0;
     return std::max(0, std::min(cfg::HOUR_LOOKAHEAD_VALUE, max_hours - 1));
 }
-
-// =============================================================================
-//  cache/danger_value_cache.py — DangerValueCache
-// =============================================================================
 
 struct Array3D {
     int levels = 0, height = 0, width = 0;
@@ -1007,9 +797,8 @@ struct DangerValueCache {
     double scale_x = 1.0, scale_y = 1.0, flight_speed = cfg::FLIGHT_SPEED;
     int max_x3d = 0, max_y3d = 0;
 
-    // total_danger_cache: dict[(x,y,level,hour)] -> (danger, hour)
     FlatDangerMap cache;
-    std::vector<uint64_t> insertion_order;   // питоновский dict сохраняет порядок вставки
+    std::vector<uint64_t> insertion_order;
     size_t order_head = 0;
 
     DangerValueCache(const DangerMapCache* mc, const std::vector<Array3D>* a3d,
@@ -1025,7 +814,7 @@ struct DangerValueCache {
     }
 
     static inline uint64_t make_key(long x, long y, int level, int hour) {
-        // x,y >= 0 и < 2^20 на любых реальных картах
+
         return (((uint64_t)(uint32_t)x << 40) | ((uint64_t)(uint32_t)y << 20) |
                 ((uint64_t)(uint32_t)level << 8) | (uint64_t)(uint32_t)hour);
     }
@@ -1035,11 +824,9 @@ struct DangerValueCache {
         return 0.0;
     }
 
-    // возвращает (total_danger, hour_idx)
     std::pair<double, int> get_total_danger_cached(double px, double py, int level,
                                                    double distance_traveled) {
-        // ВНИМАНИЕ: ключ строится по int() (усечению), а base_danger — по round().
-        // Это расхождение оригинала (точки 100.4 и 100.6 делят ключ) — сохраняем.
+
         long x = py_trunc_i(px);
         long y = py_trunc_i(py);
         int hour_idx = (int)distance_to_hour_index(distance_traveled,
@@ -1089,15 +876,11 @@ struct DangerValueCache {
     }
 };
 
-// =============================================================================
-//  environment.py — Environment
-// =============================================================================
-
 struct Environment {
     DangerMapCache*   map2_cache = nullptr;
     DangerValueCache* danger_cache = nullptr;
     std::vector<Array3D> arrays_3d;
-    Grid2D raw_map;                  // исходная карта (для картинки)
+    Grid2D raw_map;
     int height = 0, width = 0;
     int array_levels = 0, array_height = 0, array_width = 0;
     int MAX_X_3D = 0, MAX_Y_3D = 0;
@@ -1118,7 +901,7 @@ struct Environment {
         map2_cache = new DangerMapCache(raw_map);
 
         for (const auto& p : array_files) {
-            if (!file_exists(p)) continue;          // _load_npy_arrays молча пропускает
+            if (!file_exists(p)) continue;
             NpyArray a = load_npy(p);
             if (a.shape.size() != 3)
                 throw std::runtime_error("ValueError: 3D array expected: " + p);
@@ -1147,27 +930,12 @@ struct Environment {
     ~Environment() { delete danger_cache; delete map2_cache; }
 };
 
-// =============================================================================
-//  dijkstra.py — двоичная куча (тот же массивный вариант, что в numba)
-// =============================================================================
-
-// Гибридная раскладка кучи. Приоритеты — отдельным плотным массивом: при
-// просеивании сравниваются именно они, и когда они лежат подряд, дети
-// (2i+1, 2i+2) почти всегда в одной кэшлинии, а верхушка кучи целиком сидит
-// в L1/L2. Нагрузка — 16 байт: cost + плоский индекс состояния uint32
-// (тот же, что в prev_state; четыре координаты восстанавливаются
-// арифметикой при попе). В исходных параллельных массивах numba каждый
-// обмен трогал шесть разных мест в памяти, здесь — два. Порядок сравнений
-// и обменов прежний — куча ведёт себя идентично исходной.
-// cost храним, а не перечитываем из dist_grid при попе: при переполнении
-// кучи пуш молча отбрасывается (как в питоне), и после такого дропа
-// dist_grid может стать свежее, чем стоимость записи, лежащей в куче.
 struct HeapPayload {
     double   cost;
     uint32_t state;
 };
 
-struct HeapNode {   // то, что возвращает pop()
+struct HeapNode {
     double   priority;
     double   cost;
     uint32_t state;
@@ -1178,7 +946,6 @@ struct Heap {
     Buf<HeapPayload> pay;
     long long size = 0, capacity = 0;
 
-    // np.empty — без инициализации
     void init(long long cap) {
         capacity = cap;
         pri.uninit((size_t)cap);
@@ -1226,14 +993,6 @@ struct Heap {
     }
 };
 
-// Всё крупное состояние поиска живёт в арене и переживает вызовы:
-//   * danger_grid / min_nb_danger / has_nb зависят только от карты и
-//     прогнозов, а не от старта/цели — считаются ОДИН раз и переиспользуются
-//     всеми сегментами маршрута (в питоне это пересчитывалось на каждый
-//     сегмент; значения идентичны, поэтому результат побитово тот же);
-//   * dist/aux/prev/visited/куча — переиспользуемые буферы: сброс значений
-//     дешевле, чем новые страницы у ОС на каждый сегмент.
-// Арена привязана к одному Environment (одному вызову calculate_path).
 struct StateAux { double stay, hour_stay, total_dist; };
 constexpr uint32_t NO_PREV = 0xFFFFFFFFu;
 
@@ -1247,15 +1006,9 @@ struct DijkstraArena {
     Buf<uint32_t> prev_state;
     Buf<uint8_t>  visited;
     Heap heap;
-    // --turbo: min опасности по (эшелон, час) на клетку — один раз на арену;
-    // hgrid — нижняя оценка остаточной стоимости, пересчитывается на сегмент
-    // (зависит от цели)
+
     Buf<double> min_dh, hgrid;
 };
-
-// =============================================================================
-//  dijkstra_numba_grid
-// =============================================================================
 
 struct DijkstraRaw {
     std::vector<double> px, py;
@@ -1263,19 +1016,10 @@ struct DijkstraRaw {
     std::vector<double> stay;
     std::vector<double> total_dist;
     std::vector<int>    arrays;
-    std::vector<uint8_t> frozen;   // 1 = точка петли ожидания, стадии 2 не трогать
+    std::vector<uint8_t> frozen;
     bool ok = false;
 };
 
-// Исправление п.1: превращает виртуальное ожидание ядра в реальную геометрию.
-// Ядро запоминает петли числом («+2650 px налёта» между соседними точками);
-// здесь этот скачок дистанции разворачивается в настоящие витки: челнок между
-// клеткой входа и её самым безопасным соседом ТЕКУЩЕГО часа (партнёр может
-// меняться от часа к часу вместе с погодой). После этого время маршрута
-// сжигается самой траекторией, пересчёт дистанции из геометрии становится
-// корректным, а формату (y, x, эшелон) не нужна колонка времени.
-// Точки витков помечаются frozen=1 — стадия 2 обязана их не трогать, иначе
-// сглаживание распрямит петли и ожидание снова испарится.
 static void materialize_loiter_loops(DijkstraRaw& r,
                                      const double* danger_grid,
                                      const GridBool& validity,
@@ -1317,7 +1061,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
             continue;
         }
 
-        // приходим в клетку входа — якорь петель
         px.push_back(bx); py.push_back(by); lvl.push_back(L); fz.push_back(1);
 
         const int bgx = (int)py_round_i(bx / (double)step_size);
@@ -1333,7 +1076,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
                 : std::min(rem, (double)(h + 1) * flight_speed - dpos);
             if (chunk <= 0.0) chunk = rem;
 
-            // самый безопасный сосед в час h — партнёр по челноку на этот час
             double best = 1e18, nxr = ax, nyr = ay;
             for (int d = 0; d < 8; ++d) {
                 const int gx2 = bgx + dx8[d], gy2 = bgy + dy8[d];
@@ -1360,8 +1102,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
         }
     }
 
-    // дистанции/часы/stay пересобираются из ЧИСТОЙ геометрии — теперь она
-    // содержит ожидание, поэтому пересчёт корректен по построению
     const size_t m = px.size();
     std::vector<double> td(m, 0.0), st(m, 0.0);
     std::vector<int> ar(m, 0);
@@ -1416,8 +1156,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
     const int start_gx = (int)py_round_i(start_x / (double)step_size);
     const int start_gy = (int)py_round_i(start_y / (double)step_size);
-    const int goal_gx  = (int)py_round_i(goal_x  / (double)step_size);
-    const int goal_gy  = (int)py_round_i(goal_y  / (double)step_size);
 
     const size_t N4 = (size_t)grid_h * grid_w * num_levels * max_hours;
     auto IDX = [&](int gy, int gx, int l, int h) -> size_t {
@@ -1433,10 +1171,10 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         log_info(buf);
     }
 
-    const size_t BLOCK = (size_t)num_levels * max_hours;   // размер блока одной клетки
+    const size_t BLOCK = (size_t)num_levels * max_hours;
 
     if (N4 > 0xFFFFFFFFull) {
-        // состояние должно помещаться в uint32 (куча и prev_state)
+
         log_error("Search space exceeds 2^32 states");
         out.ok = false;
         return out;
@@ -1449,9 +1187,9 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     Buf<uint8_t>&  has_nb        = arena.has_nb;
 
     if (arena_fresh) {
-    // ---- precompute_danger_grid ----
-    danger_grid.zeros(N4);   // mmap: нулевые страницы выдаются лениво, как в np.zeros
-    // каждый поток пишет свои строки gy — гонок нет, результат не зависит от порядка
+
+    danger_grid.zeros(N4);
+
     parallel_for(0, (size_t)grid_h, [&](size_t gy_) {
         const int gy = (int)gy_;
         for (int gx = 0; gx < grid_w; ++gx) {
@@ -1477,24 +1215,13 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         }
     });
 
-    // ---- предрасчёт минимума опасности по 8 соседям ----
-    // В оригинале блок барражирования каждый раз перебирает 8 соседей, считая
-    //   cycle_dist = 2*step_distance                              (константа!)
-    //   cycle_cost = 2*(0.5*(D + D_b)*danger_weight + length_penalty*step_distance)
-    // и берёт строгий минимум. cycle_cost монотонно растёт по D_b, поэтому
-    // argmin по cycle_cost = argmin по D_b, а результат — та же самая величина,
-    // посчитанная тем же выражением. Значит достаточно один раз запомнить
-    // min(D_b) по соседям: 8 разбросанных чтений в самом горячем месте
-    // превращаются в одно последовательное. Результат побитово тот же.
     min_nb_danger.zeros(N4);
     has_nb.zeros((size_t)grid_h * grid_w);
 
     {
         struct D8 { int dx, dy; };
         const D8 d8[8] = {{0,1},{1,0},{0,-1},{-1,0},{1,1},{1,-1},{-1,1},{-1,-1}};
-        // строка gy читает соседние строки, но пишет только свою -> потокобезопасно.
-        // Внутренний цикл — поэлементный min по сплошным блокам: чистый AVX2
-        // (vminpd по 4 double за такт), без редукций, порядок не важен.
+
         parallel_for(0, (size_t)grid_h, [&](size_t gy_) {
             const int gy = (int)gy_;
             const double* nb_base[8];
@@ -1521,13 +1248,10 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             }
         });
     }
-    }   // конец arena_fresh: danger_grid / min_nb_danger / has_nb готовы
+    }
 
     const double inf = 1e18;
 
-    // dist_grid держим отдельно: он читается на КАЖДОЙ попытке релаксации,
-    // а три поля aux — только на удачных и при извлечении узла. Слив их в
-    // одну структуру, мы бы тянули 32 байта там, где нужно 8.
     Buf<double>&   dist_grid  = arena.dist_grid;
     Buf<StateAux>& aux        = arena.aux;
     Buf<uint32_t>& prev_state = arena.prev_state;
@@ -1539,30 +1263,25 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
     if (arena_fresh) {
         dist_grid.filled(N4, inf);
-        aux.zeros(N4);                    // нулевые биты == ровно 0.0
+        aux.zeros(N4);
         prev_state.filled(N4, NO_PREV);
         visited.zeros(N4);
         heap.init(heap_capacity);
         arena.n4 = N4;
         arena.ready = true;
     } else {
-        // Повторный сегмент: буферы уже наши, сбрасываем значения на месте —
-        // это дешевле, чем каждый раз просить у ОС новые страницы и ловить
-        // page fault на первом касании каждых 4 КБ.
+
         std::fill(dist_grid.data(), dist_grid.data() + N4, inf);
         std::memset(aux.data(), 0, N4 * sizeof(StateAux));
-        std::memset(prev_state.data(), 0xFF, N4 * sizeof(uint32_t));   // == NO_PREV
+        std::memset(prev_state.data(), 0xFF, N4 * sizeof(uint32_t));
         std::memset(visited.data(), 0, N4);
         heap.size = 0;
     }
 
-    // ---- --turbo: допустимая эвристика через 2D-проекцию ----
     const size_t N2 = (size_t)grid_h * grid_w;
-    if (g_turbo) {
-        Timer h_timer;
+    {
         if (arena_fresh || arena.min_dh.n != N2) {
-            // min по всем (эшелон, час) на клетку: нижняя оценка опасности
-            // любого реального перехода в эту клетку
+
             arena.min_dh.uninit(N2);
             double* __restrict md = arena.min_dh.data();
             parallel_for(0, (size_t)grid_h, [&](size_t gy_) {
@@ -1577,11 +1296,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             });
         }
 
-        // Обратная Дейкстра от целевой области по 2D-сетке. Стоимость шага в
-        // клетку c: min_dh[c]*danger_weight + длина*length_penalty — это
-        // нижняя оценка любого реального ребра (штрафы эшелонов/часов/
-        // барражирования неотрицательны и отброшены). Метрика кратчайших
-        // путей по нижним оценкам допустима и консистентна.
         arena.hgrid.filled(N2, 1e18);
         double* __restrict hg = arena.hgrid.data();
         const double* __restrict md = arena.min_dh.data();
@@ -1610,7 +1324,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             const int c = top2.second;
             if (top2.first > hg[c]) continue;
             const int cgx = c % grid_w, cgy = c / grid_w;
-            // шаг назад: сосед a -> текущая c, входим в c, платим опасность c
+
             const double enter_c = md[c] * danger_weight;
             for (int d = 0; d < 8; ++d) {
                 const int agx = cgx + hdx[d], agy = cgy + hdy[d];
@@ -1628,13 +1342,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                 }
             }
         }
-        char buf[160];
-        std::snprintf(buf, sizeof(buf),
-                      "TURBO: эвристика построена за %.3fs (вес W=%.2f)",
-                      h_timer.sec(), g_wastar);
-        log_info(buf);
     }
-    const double* __restrict hgrid_ptr = g_turbo ? arena.hgrid.data() : nullptr;
+    const double* __restrict hgrid_ptr = arena.hgrid.data();
 
     const int start_hour = 0;
     dist_grid[IDX(start_gy, start_gx, start_level, start_hour)] = 0.0;
@@ -1648,7 +1357,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     };
 
     long long nodes_processed = 0;
-    long long pushes_dropped = 0;    // пуши, молча выброшенные из-за полной кучи
+    long long pushes_dropped = 0;
     bool goal_found = false;
     int gs_gx = start_gx, gs_gy = start_gy, gs_l = start_level, gs_h = start_hour;
 
@@ -1656,7 +1365,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         const HeapNode top = heap.pop();
         const double cur_cost = top.cost;
 
-        // раскодируем плоский индекс (арифметика, обратная IDX)
         const size_t cur_ni = (size_t)top.state;
         const int hour_idx = (int)(cur_ni % (size_t)max_hours);
         size_t rest = cur_ni / (size_t)max_hours;
@@ -1680,14 +1388,11 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             break;
         }
 
-        const StateAux cur_aux = aux[cur_ni];             // одна кэшлиния на три поля
+        const StateAux cur_aux = aux[cur_ni];
         const double current_total_distance = cur_aux.total_dist;
         const double current_stay           = cur_aux.stay;
         const double current_hour_stay      = cur_aux.hour_stay;
 
-        // Сначала отбираем допустимых соседей и запускаем предвыборку их блоков:
-        // пока считается первое направление, память уже тянет остальные.
-        // Порядок обхода сохраняется, поэтому результат не меняется.
         int nb_cnt = 0;
         int    nb_dir[8];
         size_t nb_block[8];
@@ -1703,9 +1408,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             nb_block[nb_cnt] = ((size_t)ngy * grid_w + ngx) * BLOCK;
             nb_cnt++;
         }
-#ifndef ASTAR_NO_PREFETCH
-        // Обращения идут не по базе блока, а вокруг текущего эшелона:
-        // смещение level*max_hours. Тянуть надо именно его.
+
         {
             const size_t centre = (size_t)level * max_hours;
             for (int k = 0; k < nb_cnt; ++k) {
@@ -1713,7 +1416,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                 __builtin_prefetch(danger_grid.data() + nb_block[k] + centre, 0, 1);
             }
         }
-#endif
 
         for (int k = 0; k < nb_cnt; ++k) {
             const int d = nb_dir[k];
@@ -1722,27 +1424,15 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
             const double step_distance = directions[d].mul * step_size;
 
-            // --- инварианты по направлению, вынесенные из двух вложенных циклов ---
             const double length_cost = step_distance * length_penalty;
-            const double lp_step = length_penalty * step_distance;
-            const double best_cycle_dist = 2.0 * step_distance;
-            // штатная эвристика: заниженный манхэттен *0.1 (фактически Дейкстра);
-            // --turbo: честная нижняя оценка остатка пути из 2D-проекции
-            const double h_val = hgrid_ptr
-                ? hgrid_ptr[(size_t)ngy * grid_w + ngx] * g_wastar
-                : (std::abs(goal_gx - ngx) + std::abs(goal_gy - ngy)) * 0.1;
+
+            const double h_val = hgrid_ptr[(size_t)ngy * grid_w + ngx] * g_wastar;
             const bool   nb_ok = has_nb[(size_t)ngy * grid_w + ngx] != 0;
 
-            // База блока клетки-назначения: дальше индексируем как
-            // [next_level * max_hours + target_hour] — сплошной кусок памяти.
             const size_t nblock = nb_block[k];
             const double* __restrict dg_blk = danger_grid.data() + nblock;
             const double* __restrict mn_blk = min_nb_danger.data() + nblock;
 
-            // Границы цикла по эшелонам посчитаны заранее вместо continue на
-            // каждой итерации: выход за [0, num_levels) режется диапазоном,
-            // подъём при незакрытом stay режется верхней границей 0.
-            // Исполняются ровно те же итерации в том же порядке.
             int lvl_lo = -lookahead_levels;
             if (level + lvl_lo < 0) lvl_lo = -level;
             int lvl_hi = (current_stay > 0.0) ? 0 : lookahead_levels;
@@ -1763,22 +1453,12 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     std::abs(lvl_shift) * cfg::LEVEL_CHANGE_PENALTY;
                 const size_t lvl_off = (size_t)next_level * max_hours;
 
-                // ВНИМАНИЕ: new_total_distance объявлена вне часового цикла и
-                // мутируется внутри него (added_dist) — как в питоне.
                 double new_total_distance = current_total_distance + step_distance;
 
                 int base_hour = (int)py_trunc_i(new_total_distance / flight_speed);
                 if (base_hour < 0) base_hour = 0;
                 if (base_hour >= max_hours) base_hour = max_hours - 1;
 
-                // Границы часового цикла тоже замкнуты аналитически:
-                //  * при hour_stay > 0 скачки вперёд (target > base) запрещены,
-                //    остаётся только hour_shift = 0 (для него target == base,
-                //    т.к. base уже приклампен к max_hours-1);
-                //  * при hour_stay == 0 итерации с target < hour_idx — пустые
-                //    continue, начинаем сразу с hour_idx - base_hour.
-                // Проверка target < hour_idx остаётся: она покрывает случай
-                // hour_stay > 0 && hour_idx > base_hour (ноль итераций).
                 const int hs_begin = (current_hour_stay > 0.0)
                     ? 0
                     : (hour_idx > base_hour ? hour_idx - base_hour : 0);
@@ -1807,61 +1487,30 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                     double added_cost = 0.0;
                     bool   loitered = false;
 
-                    // --- барражирование: «докрутить» дистанцию до нужного часа ---
                     if (target_hour > base_hour) {
                         const double required_distance = (double)target_hour * flight_speed;
                         const double need_extra = required_distance - new_total_distance;
                         if (need_extra > 0.0 && nb_ok) {
-                            if (g_legacy) {
-                                // ПИТОН-СЕМАНТИКА: всё кружение оплачивается
-                                // погодой ЦЕЛЕВОГО часа (того, которого ждём) —
-                                // ожидание под грозой стоит по тарифу «после
-                                // грозы». Плюс квантование циклами с перелётом.
-                                const double avg_danger =
-                                    0.5 * (total_danger + mn_blk[lvl_off + target_hour]);
-                                const double best_cycle_cost =
-                                    2.0 * (avg_danger * danger_weight + lp_step);
-
-                                if (best_cycle_cost < 1e17) {
-                                    loitered = true;
-                                    const long long cycles =
-                                        (long long)std::ceil(need_extra / best_cycle_dist);
-                                    added_cost = cycles * best_cycle_cost;
-                                    new_total_distance += cycles * best_cycle_dist;
-                                    int recomputed_hour =
-                                        (int)py_trunc_i(new_total_distance / flight_speed);
-                                    if (recomputed_hour > max_hours - 1) recomputed_hour = max_hours - 1;
-                                    target_hour = recomputed_hour;
-                                    if (target_hour > hour_idx)
-                                        new_hour_stay = hour_stay_distance * (target_hour - hour_idx);
-                                }
-                            } else {
-                                // ИСПРАВЛЕНО (п.3): каждый отрезок кружения
-                                // оплачивается погодой того часа, в котором он
-                                // реально пролетается. Дистанция берётся ровно
-                                // need_extra — прилетаем точно к границе часа,
-                                // без перелёта и передатировки target_hour.
-                                loitered = true;
-                                double add_c = 0.0;
-                                double dpos  = new_total_distance;
-                                double rem   = need_extra;
-                                while (rem > 1e-9) {
-                                    int h = (int)(dpos / flight_speed);
-                                    if (h > max_hours - 1) h = max_hours - 1;
-                                    double chunk = (h >= max_hours - 1)
-                                        ? rem
-                                        : std::min(rem, (double)(h + 1) * flight_speed - dpos);
-                                    if (chunk <= 0.0) chunk = rem;
-                                    const double avg_h =
-                                        0.5 * (dg_blk[lvl_off + h] + mn_blk[lvl_off + h]);
-                                    add_c += chunk * (avg_h * danger_weight / step_distance
-                                                      + length_penalty);
-                                    dpos += chunk;
-                                    rem  -= chunk;
-                                }
-                                added_cost = add_c;
-                                new_total_distance += need_extra;
+                            loitered = true;
+                            double add_c = 0.0;
+                            double dpos  = new_total_distance;
+                            double rem   = need_extra;
+                            while (rem > 1e-9) {
+                                int h = (int)(dpos / flight_speed);
+                                if (h > max_hours - 1) h = max_hours - 1;
+                                double chunk = (h >= max_hours - 1)
+                                    ? rem
+                                    : std::min(rem, (double)(h + 1) * flight_speed - dpos);
+                                if (chunk <= 0.0) chunk = rem;
+                                const double avg_h =
+                                    0.5 * (dg_blk[lvl_off + h] + mn_blk[lvl_off + h]);
+                                add_c += chunk * (avg_h * danger_weight / step_distance
+                                                  + length_penalty);
+                                dpos += chunk;
+                                rem  -= chunk;
                             }
+                            added_cost = add_c;
+                            new_total_distance += need_extra;
                         }
                     }
 
@@ -1881,13 +1530,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                             pushes_dropped++;
                     }
 
-                    // Ранний выход, строго эквивалентный оригиналу.
-                    // Как только base_hour + hour_shift упёрлось в потолок
-                    // (max_hours-1) и барражирования на этом шаге не было,
-                    // все оставшиеся hour_shift дают ПОБИТОВО ту же тройку
-                    // (target_hour, new_total_distance, new_cost) и тот же ni,
-                    // т.е. проверка `new_cost < dist_grid[ni]` заведомо не
-                    // пройдёт. Питон честно докручивает эти итерации вхолостую.
                     if (!loitered && target_hour == max_hours - 1 &&
                         base_hour + hour_shift >= max_hours - 1) break;
                 }
@@ -1895,7 +1537,6 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         }
     }
 
-    // ---- фолбэк: лучший посещённый узел в утроенном допуске ----
     if (!goal_found) {
         double best_cost = inf;
         for (int gy = 0; gy < grid_h; ++gy) {
@@ -1935,17 +1576,13 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     if (!goal_found) { out.ok = false; return out; }
 
     {
-        // стоимость найденного оптимума — метрика для сравнения режимов:
-        // у --turbo она обязана совпадать со штатным режимом
+
         char buf[160];
         std::snprintf(buf, sizeof(buf), "Стоимость цели: %.6f",
                       dist_grid[IDX(gs_gy, gs_gx, gs_l, gs_h)]);
         log_info(buf);
     }
 
-    // ---- восстановление пути ----
-    // Идём по плоским индексам предков; (gy, gx, level, hour) раскладываются
-    // обратно арифметикой, обратной IDX().
     std::vector<double> ppx, ppy, pstay, pdist;
     std::vector<int> plvl, parr;
 
@@ -1965,7 +1602,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
         parr.push_back(hr);
 
         const uint32_t pr = prev_state[cur];
-        if (pr == NO_PREV) break;      // дошли до стартового узла
+        if (pr == NO_PREV) break;
         cur = pr;
     }
 
@@ -1984,19 +1621,11 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     out.arrays = std::move(parr);
     out.ok = true;
 
-    if (g_legacy) {
-        out.frozen.assign(out.px.size(), 0);   // питон: ожидание остаётся виртуальным
-    } else {
-        materialize_loiter_loops(out, danger_grid.data(), validity_cache,
-                                 grid_w, grid_h, width, height,
-                                 step_size, num_levels, max_hours, flight_speed);
-    }
+    materialize_loiter_loops(out, danger_grid.data(), validity_cache,
+                             grid_w, grid_h, width, height,
+                             step_size, num_levels, max_hours, flight_speed);
     return out;
 }
-
-// =============================================================================
-//  refine_path_to_goal_with_constraints
-// =============================================================================
 
 struct RefinedPath {
     std::vector<double> xs, ys;
@@ -2004,7 +1633,7 @@ struct RefinedPath {
     std::vector<double> stay;
     std::vector<double> total_dist;
     std::vector<int>    arrays;
-    std::vector<uint8_t> frozen;   // распространяется с точек петель ожидания
+    std::vector<uint8_t> frozen;
 };
 
 static RefinedPath refine_path_to_goal_with_constraints(
@@ -2022,16 +1651,11 @@ static RefinedPath refine_path_to_goal_with_constraints(
         return i < path_frozen.size() ? path_frozen[i] : 0;
     };
 
-    // [BUG 1] В оригинале аргументы distance_to_hour_index идут в неверном
-    // порядке: (dist, FLIGHT_SPEED, HOURS_PER_ARRAY_SLICE, arrays_count),
-    // тогда как сигнатура (dist, arrays_count, flight_speed, hours_per_slice).
-    // Т.е. фактически arrays_count=1000.0, flight_speed=1.0, hours_per_slice=10.
-    // Переносим как есть — влияет только на отчёт analyze_array_usage.
     auto buggy_hour = [&](double dist) -> int {
         return (int)distance_to_hour_index(dist,
-                                           /*arrays_count=*/cfg::FLIGHT_SPEED,
-                                           /*flight_speed=*/cfg::HOURS_PER_ARRAY_SLICE,
-                                           /*hours_per_slice=*/(double)arrays_count);
+                                           cfg::FLIGHT_SPEED,
+                                           cfg::HOURS_PER_ARRAY_SLICE,
+                                           (double)arrays_count);
     };
 
     r.xs.push_back(path_x[0]);
@@ -2089,7 +1713,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
                 r.stay.push_back(interpolated_stay);
                 r.total_dist.push_back(interpolated_dist);
                 r.arrays.push_back(buggy_hour(interpolated_dist));
-                // точка внутри отрезка петли заморожена, если оба конца заморожены
+
                 r.frozen.push_back(fz(i) && fz(i + 1) ? 1 : 0);
             }
             r.xs.push_back(ex); r.ys.push_back(ey);
@@ -2123,7 +1747,7 @@ static RefinedPath refine_path_to_goal_with_constraints(
         }
     }
 
-    r.frozen.push_back(0);   // сама цель не заморожена
+    r.frozen.push_back(0);
     r.xs.push_back(goal_x); r.ys.push_back(goal_y);
     r.levels.push_back(goal_level);
     const size_t k = r.xs.size();
@@ -2175,17 +1799,7 @@ static void analyze_array_usage(const std::vector<int>& arr_idx, int total_array
              std::to_string(total_arrays));
 }
 
-// =============================================================================
-//  utils.py — веса и фитнес
-// =============================================================================
-
 struct Weights { double safety, length, smoothness, level_change; };
-
-// используется в питоне только для логирования базовых весов
-[[maybe_unused]] static Weights get_static_weights() {
-    return {cfg::SAFETY_WEIGHT, cfg::LENGTH_WEIGHT, cfg::SMOOTHNESS_WEIGHT,
-            cfg::LEVEL_CHANGE_PENALTY};
-}
 
 static Weights calculate_fixed_weights(double path_length) {
     double safety = cfg::SAFETY_WEIGHT *
@@ -2197,9 +1811,6 @@ static Weights calculate_fixed_weights(double path_length) {
     return {safety, length, cfg::SMOOTHNESS_WEIGHT, cfg::LEVEL_CHANGE_PENALTY};
 }
 
-// path_fitness_numba
-// Работает на сырых указателях: вызывается из параллельной секции и не должна
-// ничего аллоцировать. Читает только неизменяемые данные -> потокобезопасна.
 static double path_fitness(const double* __restrict xs, const double* __restrict ys,
                            const int* __restrict levels,
                            const double* __restrict total_dists, int n,
@@ -2262,7 +1873,6 @@ static double path_fitness(const double* __restrict xs, const double* __restrict
            w_smooth * total_curvature + w_level_change * (double)total_level_changes;
 }
 
-// find_optimal_level_with_constraints — сравнение КОРТЕЖЕЙ (danger, hour), как в питоне
 static int find_optimal_level_with_constraints(double px, double py, int current_level,
                                                double current_level_distance,
                                                double total_distance, Environment& env) {
@@ -2279,7 +1889,7 @@ static int find_optimal_level_with_constraints(double px, double py, int current
         }
         std::pair<double, int> d =
             env.danger_cache->get_total_danger_cached(px, py, cand, total_distance);
-        // лексикографическое сравнение кортежей, как в Python
+
         if (d.first < best.first || (d.first == best.first && d.second < best.second)) {
             best = d;
             best_level = cand;
@@ -2288,7 +1898,6 @@ static int find_optimal_level_with_constraints(double px, double py, int current
     return best_level;
 }
 
-// generate_safe_candidates
 static void generate_safe_candidates(const std::vector<double>& path_xs,
                                      const std::vector<double>& path_ys,
                                      int center_index, double cur_x, double cur_y,
@@ -2306,7 +1915,7 @@ static void generate_safe_candidates(const std::vector<double>& path_xs,
         const double ideal_x = (path_xs[center_index - 1] + path_xs[center_index + 1]) / 2.0;
         const double ideal_y = (path_ys[center_index - 1] + path_ys[center_index + 1]) / 2.0;
         const double dx = ideal_x - cur_x, dy = ideal_y - cur_y;
-        const double dist_to_ideal = std::sqrt(dx * dx + dy * dy);   // np.linalg.norm
+        const double dist_to_ideal = std::sqrt(dx * dx + dy * dy);
         if (dist_to_ideal > 0.0) {
             dir_x = dx / dist_to_ideal;
             dir_y = dy / dist_to_ideal;
@@ -2328,10 +1937,6 @@ static void generate_safe_candidates(const std::vector<double>& path_xs,
         }
     }
 }
-
-// =============================================================================
-//  optimize_path_with_fixed_weights
-// =============================================================================
 
 struct OptimizeResult {
     std::vector<double> xs, ys;
@@ -2393,8 +1998,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
         return fitness_raw(xs.data(), ys.data(), lv.data(), td.data(), (int)xs.size());
     };
 
-    // Плоские буферы под кандидатов: одна аллокация на всю оптимизацию вместо
-    // vector<vector<...>> на каждый кандидат.
     const size_t MAXC = (size_t)cfg::NUM_CANDIDATES + 1;
     std::vector<double> cand_tx(MAXC * n_points), cand_ty(MAXC * n_points),
                         cand_ttd(MAXC * n_points), cand_fit(MAXC);
@@ -2410,11 +2013,10 @@ static OptimizeResult optimize_path_with_fixed_weights(
         }
         long iteration_improvement = 0;
 
-        // ВНИМАНИЕ: best_fitness НЕ сбрасывается на каждой точке — как в питоне
         double best_fitness = fitness_of(path_xs, path_ys, path_levels, path_total_distances);
 
         for (int i = 1; i < n_points - 1; ++i) {
-            if (frozen && frozen[i]) continue;   // витки ожидания не двигаем
+            if (frozen && frozen[i]) continue;
 
             const double cur_x = path_xs[i], cur_y = path_ys[i];
             const int    current_level = path_levels[i];
@@ -2435,10 +2037,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
 
             const size_t ncand = cand_x.size();
 
-            // --- Фаза A (последовательно): временные пути и выбор эшелона.
-            // Трогает кеш опасности, а он из-за особенностей оригинала (ключ по
-            // int(), значение по round()) зависит от порядка обращений —
-            // поэтому строго по очереди, как в питоне.
             {
                 std::vector<double> tx, ty, sx, sy;
                 for (size_t c = 0; c < ncand; ++c) {
@@ -2469,16 +2067,12 @@ static OptimizeResult optimize_path_with_fixed_weights(
                 }
             }
 
-            // --- Фаза B (параллельно): fitness — чистая функция от неизменяемых
-            // данных, поэтому порядок вычисления на результат не влияет.
             parallel_for(0, ncand, [&](size_t c) {
                 cand_fit[c] = fitness_raw(&cand_tx[c * n_points], &cand_ty[c * n_points],
                                           &cand_lv[c * n_points], &cand_ttd[c * n_points],
                                           n_points);
             });
 
-            // --- Фаза C (последовательно): свёртка ровно в том же порядке,
-            // что и в питоне, включая счётчик улучшений.
             for (size_t c = 0; c < ncand; ++c) {
                 if (cand_fit[c] < best_fitness) {
                     best_fitness = cand_fit[c];
@@ -2535,10 +2129,6 @@ static OptimizeResult optimize_path_with_fixed_weights(
     r.fitness_progress = std::move(best_fitness_progress);
     return r;
 }
-
-// =============================================================================
-//  pipeline.py
-// =============================================================================
 
 struct SegmentResult {
     std::vector<double> d_xs, d_ys;
@@ -2604,9 +2194,7 @@ static SegmentResult run_segment_pipeline(int segment_idx,
         sx, sy, ex, ey, start_level, goal_level,
         env.map2_cache->validity_cache, env.map2_cache->danger_cache,
         env.arrays_3d, cfg::LEVEL_PENALTIES,
-        cfg::DIJKSTRA_STEP_SIZE,
-        g_lookahead >= 0 ? g_lookahead : cfg::LOOKAHEAD_LEVELS,
-        cfg::LEVEL_STAY_MULTIPLIER,
+        cfg::DIJKSTRA_STEP_SIZE, cfg::LOOKAHEAD_LEVELS, cfg::LEVEL_STAY_MULTIPLIER,
         cfg::NUM_LEVELS, cfg::FLIGHT_SPEED, (int)env.arrays_3d.size(),
         cfg::SAFETY_WEIGHT * cfg::DIJKSTRA_DANGER_WEIGHT,
         cfg::LENGTH_WEIGHT * cfg::DIJKSTRA_LENGTH_PENALTY,
@@ -2685,7 +2273,7 @@ struct CombinedResult {
 };
 
 static CombinedResult stitch_segment_results(const std::vector<SegmentResult>& segs,
-                                             Environment& /*env*/,
+                                             Environment& ,
                                              const std::vector<int>* route_levels) {
     CombinedResult c;
     if (segs.empty()) return c;
@@ -2725,7 +2313,6 @@ static CombinedResult stitch_segment_results(const std::vector<SegmentResult>& s
     return c;
 }
 
-// Итоговый ответ: массив (y, x, level)
 struct RouteRow { long long y, x, level; };
 
 static std::vector<RouteRow> build_route_response(const CombinedResult& cr) {
@@ -2744,7 +2331,7 @@ static std::vector<RouteRow> build_route_response(const CombinedResult& cr) {
         const long long xi = (long long)py_round_i((*px)[i]);
         const long long yi = (long long)py_round_i((*py)[i]);
         const long long li = (i < lv->size()) ? (long long)(*lv)[i] : 0LL;
-        // _convert_result_xy_to_yx: (x, y, level) -> (y, x, level)
+
         r.y = yi;
         r.x = xi;
         r.level = li;
@@ -2752,10 +2339,6 @@ static std::vector<RouteRow> build_route_response(const CombinedResult& cr) {
     }
     return out;
 }
-
-// =============================================================================
-//  PNG writer (без внешних зависимостей: deflate stored blocks)
-// =============================================================================
 
 static uint32_t crc_table[256];
 static bool crc_table_ready = false;
@@ -2809,7 +2392,6 @@ static void write_chunk(std::ofstream& f, const char type[4], const std::vector<
     f.write((const char*)ce.data(), ce.size());
 }
 
-// rgb: width*height*3
 static bool write_png(const std::string& path, int width, int height,
                       const std::vector<uint8_t>& rgb) {
     std::ofstream f(path, std::ios::binary);
@@ -2821,14 +2403,13 @@ static bool write_png(const std::string& path, int width, int height,
     std::vector<uint8_t> ihdr;
     put_u32be(ihdr, (uint32_t)width);
     put_u32be(ihdr, (uint32_t)height);
-    ihdr.push_back(8);   // bit depth
-    ihdr.push_back(2);   // colour type: truecolour
+    ihdr.push_back(8);
+    ihdr.push_back(2);
     ihdr.push_back(0);
     ihdr.push_back(0);
     ihdr.push_back(0);
     write_chunk(f, "IHDR", ihdr);
 
-    // raw scanlines с фильтром 0
     std::vector<uint8_t> raw;
     raw.reserve((size_t)height * (1 + (size_t)width * 3));
     for (int y = 0; y < height; ++y) {
@@ -2837,7 +2418,6 @@ static bool write_png(const std::string& path, int width, int height,
         raw.insert(raw.end(), row, row + (size_t)width * 3);
     }
 
-    // zlib-контейнер с deflate stored-блоками
     std::vector<uint8_t> z;
     z.push_back(0x78);
     z.push_back(0x01);
@@ -2860,10 +2440,6 @@ static bool write_png(const std::string& path, int width, int height,
     write_chunk(f, "IEND", {});
     return true;
 }
-
-// =============================================================================
-//  Визуализация — аналог visualize_map_with_path()
-// =============================================================================
 
 struct Canvas {
     int w = 0, h = 0;
@@ -2893,7 +2469,7 @@ struct Canvas {
             disc(x0 + dx * t, y0 + dy * t, thick, r, g, b);
         }
     }
-    // 5-конечная звезда (аналог matplotlib marker='*')
+
     void star(double cx, double cy, double R, uint8_t r, uint8_t g, uint8_t b) {
         const int N = 10;
         double vx[N], vy[N];
@@ -2923,7 +2499,7 @@ struct Canvas {
 static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& route,
                       double start_x, double start_y, double goal_x, double goal_y,
                       const std::string& save_path) {
-    // Подгоняем разрешение под ~матплотлибовское (12x9 дюймов * 150 dpi = 1800x1350)
+
     const int MAXDIM = 1800;
     int factor = 1;
     while (danger_map.width / factor > MAXDIM || danger_map.height / factor > MAXDIM) factor++;
@@ -2934,7 +2510,6 @@ static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& rou
     Canvas cv;
     cv.init(W, H);
 
-    // нормировка как у matplotlib imshow (vmin/vmax по данным), cmap="gray_r", alpha=0.8
     double vmin = danger_map.v.empty() ? 0.0 : danger_map.v[0];
     double vmax = vmin;
     for (double v : danger_map.v) { vmin = std::min(vmin, v); vmax = std::max(vmax, v); }
@@ -2945,8 +2520,8 @@ static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& rou
             const int sy = std::min(danger_map.height - 1, y * factor);
             const int sx = std::min(danger_map.width - 1, x * factor);
             const double norm = (danger_map.at(sy, sx) - vmin) / span;
-            const double gray = 1.0 - norm;                 // gray_r
-            const double shown = 0.8 * gray + 0.2 * 1.0;    // alpha=0.8 поверх белого
+            const double gray = 1.0 - norm;
+            const double shown = 0.8 * gray + 0.2 * 1.0;
             const uint8_t c = (uint8_t)std::lround(std::max(0.0, std::min(1.0, shown)) * 255.0);
             cv.set(x, y, c, c, c);
         }
@@ -2958,11 +2533,11 @@ static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& rou
     for (size_t i = 0; i + 1 < route.size(); ++i) {
         cv.line((double)route[i].x * sc,     (double)route[i].y * sc,
                 (double)route[i + 1].x * sc, (double)route[i + 1].y * sc,
-                lw, 214, 39, 40);   // красный
+                lw, 214, 39, 40);
     }
 
-    cv.star(start_x * sc, start_y * sc, 9.0, 0, 150, 0);      // зелёная звезда — старт
-    cv.star(goal_x  * sc, goal_y  * sc, 9.0, 0, 60, 220);     // синяя звезда — финиш
+    cv.star(start_x * sc, start_y * sc, 9.0, 0, 150, 0);
+    cv.star(goal_x  * sc, goal_y  * sc, 9.0, 0, 60, 220);
 
     if (write_png(save_path, W, H, cv.px))
         std::cout << "Карта сохранена: " << save_path << " (" << W << "x" << H << ")\n";
@@ -2970,16 +2545,11 @@ static void visualize(const Grid2D& danger_map, const std::vector<RouteRow>& rou
         log_error("Не удалось записать " + save_path);
 }
 
-// =============================================================================
-//  calculate_path + main
-// =============================================================================
-
-// route_points приходят как (y, x) — как во внешнем API питона
 static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, double>>& route_yx,
                                             const std::string& map_file,
                                             const std::vector<std::string>& array_files,
                                             Environment*& env_out) {
-    // _convert_route_points_yx_to_xy
+
     std::vector<std::pair<double, double>> route_xy;
     for (auto& p : route_yx) route_xy.emplace_back(p.second, p.first);
 
@@ -3011,11 +2581,8 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
     log_info("All route points are valid");
     log_info("Total segments: " + std::to_string(route_xy.size() - 1));
 
-    int hour_lookahead = get_hour_lookahead_value((int)env->arrays_3d.size());
-    if (g_hourlook >= 0)
-        hour_lookahead = std::min(g_hourlook, (int)env->arrays_3d.size() - 1);
+    const int hour_lookahead = get_hour_lookahead_value((int)env->arrays_3d.size());
 
-    // одна арена на все сегменты: предрасчёты Дейкстры считаются один раз
     DijkstraArena arena;
 
     std::vector<SegmentResult> segs;
@@ -3049,7 +2616,6 @@ int main(int argc, char** argv) {
 
     Timer wall;
 
-    // ---- маршрут по умолчанию, в (y, x) ----
     std::vector<std::pair<double, double>> route_points = {
         {2000.0, 8000.0},
         {3000.0, 3850.0},
@@ -3060,27 +2626,13 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a.rfind("--threads=", 0) == 0) g_threads = (unsigned)std::atoi(a.c_str() + 10);
-        else if (a == "--legacy") g_legacy = true;
-        else if (a == "--turbo") g_turbo = true;
-        else if (a.rfind("--wastar=", 0) == 0) { g_turbo = true; g_wastar = std::atof(a.c_str() + 9); }
-        else if (a.rfind("--lookahead=", 0) == 0) g_lookahead = std::atoi(a.c_str() + 12);
-        else if (a.rfind("--hourlook=", 0) == 0) g_hourlook = std::atoi(a.c_str() + 11);
+        else if (a.rfind("--wastar=", 0) == 0) g_wastar = std::atof(a.c_str() + 9);
         else pos.push_back(a);
     }
-    if (g_legacy)
-        log_info("РЕЖИМ LEGACY: питон-семантика ожиданий (петли виртуальны, "
-                 "кружение по цене целевого часа) — бит-в-бит как оригинал");
-    else
-        log_info("Модель ожиданий: исправленная (петли в геометрии, кружение "
-                 "по погоде реальных часов). Питон-поведение: --legacy");
-    if (g_turbo) {
-        char buf[400];
-        std::snprintf(buf, sizeof(buf),
-                      "РЕЖИМ TURBO: A*-эвристика вкл, W=%.2f, lookahead=%s, hourlook=%s "
-                      "(результат может отличаться от эталона среди равноценных маршрутов)",
-                      g_wastar,
-                      g_lookahead >= 0 ? std::to_string(g_lookahead).c_str() : "штатный",
-                      g_hourlook >= 0 ? std::to_string(g_hourlook).c_str() : "штатный");
+    if (!(g_wastar >= 1.0)) g_wastar = 1.0;
+    if (g_wastar != 1.0) {
+        char buf[120];
+        std::snprintf(buf, sizeof(buf), "Взвешенный A*: W=%.2f", g_wastar);
         log_info(buf);
     }
 #ifdef _OPENMP
@@ -3122,11 +2674,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Таймер расчёта останавливается здесь: всё, что ниже (печать маршрута,
-    // рисование и запись cpp_test.png), в замер не входит.
     const double compute_time = wall.sec();
 
-    // печать результата (аналог print(result) в питоне): (y, x, level)
     std::cout << "\nМаршрут (" << result.size() << " точек), формат (y, x, level):\n[";
     for (size_t i = 0; i < result.size(); ++i) {
         if (i) std::cout << "\n ";
@@ -3134,7 +2683,6 @@ int main(int argc, char** argv) {
     }
     std::cout << "]\n\n";
 
-    // визуализация
     const double start_x = route_points.front().second;
     const double start_y = route_points.front().first;
     const double goal_x  = route_points.back().second;
