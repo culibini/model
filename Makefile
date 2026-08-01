@@ -1,45 +1,32 @@
-# make              - собрать ./astar_port
-# make run          - собрать и запустить; точки: make run ARGS="3000 3850 1500 1500"
-#                     доп. флаги: --wastar=W (скорость за счёт качества), --threads=N
-# make pgo          - сборка с profile-guided optimization (нужна data/ рядом)
-# make portable     - без -march=native, бинарник переносим между машинами
-# make debug        - отладочная сборка с санитайзерами
-# make clean
-
 CXX      ?= g++
 STD       = -std=c++17
 WARN      = -Wall -Wextra
 OPT      ?= -O3 -march=native
 PAR       = -pthread -fopenmp
-CXXFLAGS ?= $(OPT) $(STD) $(WARN) $(PAR)
+CXXFLAGS ?= $(OPT) $(STD) $(WARN) $(PAR) -fPIC
 
-TARGET = astar_port
-SRC    = astar_port.cpp
+LIBDIR = astar
+SRC    = $(wildcard $(LIBDIR)/src/*.cpp)
+OBJ    = $(SRC:.cpp=.o)
+LIB    = $(LIBDIR)/libastar.so
 ARGS  ?=
 
-all: $(TARGET)
+all: $(LIB)
 
-$(TARGET): $(SRC) Makefile
-	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
+$(LIBDIR)/src/%.o: $(LIBDIR)/src/%.cpp $(wildcard $(LIBDIR)/src/*.hpp) $(wildcard $(LIBDIR)/include/astar/*.hpp) Makefile
+	$(CXX) $(CXXFLAGS) -I$(LIBDIR)/include -I$(LIBDIR)/src -c $< -o $@
 
-run: $(TARGET)
-	./$(TARGET) $(ARGS)
+$(LIB): $(OBJ)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $(OBJ)
 
-pgo: $(SRC)
-	$(CXX) $(CXXFLAGS) -fprofile-generate -o $(TARGET) $(SRC)
-	./$(TARGET) $(ARGS)
-	$(CXX) $(CXXFLAGS) -fprofile-use -fprofile-correction -o $(TARGET) $(SRC)
-	@echo "PGO-сборка готова: ./$(TARGET)"
+run: $(LIB)
+	python3 run_astar.py $(ARGS)
 
 portable:
 	$(MAKE) clean
-	$(MAKE) OPT="-O3" $(TARGET)
-
-debug: $(SRC)
-	$(CXX) -O0 -g $(STD) $(WARN) -pthread -fsanitize=address,undefined \
-		-o $(TARGET)_debug $(SRC)
+	$(MAKE) OPT="-O3" $(LIB)
 
 clean:
-	rm -f $(TARGET) $(TARGET)_debug *.gcda
+	rm -f $(OBJ) $(LIB)
 
-.PHONY: all run pgo portable debug clean
+.PHONY: all run portable clean
