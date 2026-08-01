@@ -1,9 +1,5 @@
 CXX      ?= g++
-STD       = -std=c++17
-WARN      = -Wall -Wextra
-OPT      ?= -O3
-PAR       = -pthread -fopenmp
-CXXFLAGS ?= $(OPT) $(STD) $(WARN) $(PAR) -fPIC
+CXXFLAGS  = -O3 -std=c++17 -Wall -Wextra -pthread -fopenmp -fPIC
 
 LIBDIR = astar
 SRC    = $(wildcard $(LIBDIR)/src/*.cpp)
@@ -22,11 +18,7 @@ $(LIB): $(OBJ)
 run: $(LIB)
 	python3 run_astar.py $(ARGS)
 
-native:
-	$(MAKE) clean
-	$(MAKE) OPT="-O3 -march=native" $(LIB)
-
 clean:
 	rm -f $(OBJ) $(LIB)
 
-.PHONY: all run native clean
+.PHONY: all run clean
