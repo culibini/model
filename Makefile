@@ -1,14 +1,18 @@
 CXX      ?= g++
 CXXFLAGS  = -O3 -std=c++17 -Wall -Wextra -pthread -fopenmp -fPIC
 
-LIBDIR = astar
-SRC    = $(wildcard $(LIBDIR)/src/*.cpp)
-OBJ    = $(SRC:.cpp=.o)
-LIB    = $(LIBDIR)/libastar.so
+LIBDIR   = astar
+BUILDDIR = build
+SRC      = $(wildcard $(LIBDIR)/src/*.cpp)
+OBJ      = $(patsubst $(LIBDIR)/src/%.cpp,$(BUILDDIR)/%.o,$(SRC))
+LIB      = $(LIBDIR)/libastar.so
 
 all: $(LIB)
 
-$(LIBDIR)/src/%.o: $(LIBDIR)/src/%.cpp $(wildcard $(LIBDIR)/src/*.hpp) $(wildcard $(LIBDIR)/include/astar/*.hpp) Makefile
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
+
+$(BUILDDIR)/%.o: $(LIBDIR)/src/%.cpp $(wildcard $(LIBDIR)/src/*.hpp) $(wildcard $(LIBDIR)/include/astar/*.hpp) Makefile | $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) -I$(LIBDIR)/include -I$(LIBDIR)/src -c $< -o $@
 
 $(LIB): $(OBJ)
