@@ -1060,7 +1060,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
 
     const int dx8[8] = {0, 1, 0, -1, 1, 1, -1, -1};
     const int dy8[8] = {1, 0, -1, 0, 1, -1, 1, -1};
-    long total_loop_points = 0;
 
     for (size_t i = 0; i + 1 < n; ++i) {
         const double ax = r.px[i], ay = r.py[i];
@@ -1107,7 +1106,6 @@ static void materialize_loiter_loops(DijkstraRaw& r,
             for (long k = 0; k < loops; ++k) {
                 px.push_back(nxr); py.push_back(nyr); lvl.push_back(L); fz.push_back(1);
                 px.push_back(bx);  py.push_back(by);  lvl.push_back(L); fz.push_back(1);
-                total_loop_points += 2;
             }
             const double flown = (double)loops * loop_len;
             dpos += flown;
