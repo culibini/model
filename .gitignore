@@ -71,3 +71,9 @@ datadisk/
 # pip
 .venv
 *.ckpt
+
+# astar C++ port build artifacts
+astar_port
+astar_port_debug
+*.gcda
+cpp_test.png
