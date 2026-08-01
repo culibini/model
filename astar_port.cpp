@@ -9,19 +9,19 @@
 //      ./data/map-test.npy      — 2D карта опасности
 //      ./data/0h.npy ... 9h.npy — 3D прогнозы (level, y, x)
 //
-//  Сборка (флаги обязательны — без -O это в десятки раз медленнее питона,
-//  потому что numba свои ядра компилирует, а тут компилятор ничего не делает):
+//  Сборка — просто `make` (рядом лежит Makefile):
 //
-//      g++ -O3 -march=native -pthread -std=c++17 -o astar_port astar_port.cpp
+//      make            собрать ./astar_port
+//      make run        собрать и запустить (точки: make run ARGS="...")
+//      make pgo        двухпроходная сборка с profile-guided optimization
 //
-//      -O3            оптимизация и автовекторизация
-//      -march=native  разрешает AVX2/FMA под конкретный процессор
-//      -pthread       многопоточность
-//
-//  Опционально -ffp-contract=off: запрещает схлопывать a*b+c в FMA, чтобы
-//  результат гарантированно не зависел от того, на какой машине собрано.
-//  Стоит примерно 12% скорости. По умолчанию не нужен — numba тоже собирает
-//  свои ядра с fastmath, то есть с FMA.
+//  Вручную (эквивалент make):
+//      g++ -O3 -march=native -fopenmp -pthread -std=c++17 -o astar_port astar_port.cpp
+//  Флаги обязательны: без -O это в разы медленнее питона (numba свои ядра
+//  компилирует с оптимизацией, а тут компилятор ничего не делает).
+//  -fopenmp опционален (без него — фолбэк на std::thread, чуть медленнее
+//  стадия 2). Опционально -ffp-contract=off: запрещает схлопывать a*b+c в
+//  FMA, чтобы результат не зависел от машины сборки; стоит ~12% скорости.
 //
 //  Запуск:
 //      ./astar_port
@@ -75,6 +75,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -260,14 +264,32 @@ static unsigned g_threads = 0;   // 0 => hardware_concurrency
 
 static unsigned thread_count() {
     if (g_threads) return g_threads;
+#ifdef _OPENMP
+    return (unsigned)omp_get_max_threads();
+#else
     unsigned n = std::thread::hardware_concurrency();
     return n ? n : 1u;
+#endif
 }
 
+// При сборке с -fopenmp используется персистентный пул потоков OpenMP —
+// потоки создаются один раз, а не на каждый вызов (это важно на стадии 2,
+// где parallel_for дёргается тысячи раз). Без OpenMP — фолбэк на std::thread.
+// Разбиение static детерминировано, но параллелятся только участки, где
+// порядок вычислений не влияет на результат.
 template <typename F>
 static void parallel_for(size_t begin, size_t end, F&& body) {
     if (end <= begin) return;
     const size_t total = end - begin;
+#ifdef _OPENMP
+    if (total < 2) {
+        for (size_t i = begin; i < end; ++i) body(i);
+        return;
+    }
+    const long long n = (long long)total;
+#pragma omp parallel for schedule(static)
+    for (long long i = 0; i < n; ++i) body(begin + (size_t)i);
+#else
     unsigned nt = thread_count();
     if (nt <= 1 || total < 2) {
         for (size_t i = begin; i < end; ++i) body(i);
@@ -284,6 +306,7 @@ static void parallel_for(size_t begin, size_t end, F&& body) {
         th.emplace_back([&body, b, e] { for (size_t i = b; i < e; ++i) body(i); });
     }
     for (auto& x : th) x.join();
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -1074,19 +1097,23 @@ struct Environment {
 // Гибридная раскладка кучи. Приоритеты — отдельным плотным массивом: при
 // просеивании сравниваются именно они, и когда они лежат подряд, дети
 // (2i+1, 2i+2) почти всегда в одной кэшлинии, а верхушка кучи целиком сидит
-// в L1/L2. Остальная нагрузка (cost, x, y, level, hour) упакована в одну
-// 24-байтовую структуру: при обмене трогаем два места в памяти, а не шесть,
-// как в исходных параллельных массивах numba. Порядок сравнений и обменов
-// прежний — куча ведёт себя идентично исходной.
+// в L1/L2. Нагрузка — 16 байт: cost + плоский индекс состояния uint32
+// (тот же, что в prev_state; четыре координаты восстанавливаются
+// арифметикой при попе). В исходных параллельных массивах numba каждый
+// обмен трогал шесть разных мест в памяти, здесь — два. Порядок сравнений
+// и обменов прежний — куча ведёт себя идентично исходной.
+// cost храним, а не перечитываем из dist_grid при попе: при переполнении
+// кучи пуш молча отбрасывается (как в питоне), и после такого дропа
+// dist_grid может стать свежее, чем стоимость записи, лежащей в куче.
 struct HeapPayload {
-    double  cost;
-    int32_t x, y, level, hour;
+    double   cost;
+    uint32_t state;
 };
 
 struct HeapNode {   // то, что возвращает pop()
-    double  priority;
-    double  cost;
-    int32_t x, y, level, hour;
+    double   priority;
+    double   cost;
+    uint32_t state;
 };
 
 struct Heap {
@@ -1102,12 +1129,12 @@ struct Heap {
         size = 0;
     }
 
-    void push(double priority, double cost, int32_t x, int32_t y, int32_t level, int32_t hour) {
+    void push(double priority, double cost, uint32_t state) {
         double*      __restrict p  = pri.data();
         HeapPayload* __restrict pl = pay.data();
         long long idx = size;
         p[idx]  = priority;
-        pl[idx] = HeapPayload{cost, x, y, level, hour};
+        pl[idx] = HeapPayload{cost, state};
         while (idx > 0) {
             const long long parent = (idx - 1) / 2;
             if (p[parent] <= p[idx]) break;
@@ -1121,7 +1148,7 @@ struct Heap {
     HeapNode pop() {
         double*      __restrict p  = pri.data();
         HeapPayload* __restrict pl = pay.data();
-        if (size == 0) return HeapNode{0.0, 0.0, 0, 0, 0, 0};
+        if (size == 0) return HeapNode{0.0, 0.0, 0};
         const double      top_p  = p[0];
         const HeapPayload top_pl = pl[0];
         size -= 1;
@@ -1138,8 +1165,31 @@ struct Heap {
             std::swap(pl[idx], pl[smallest]);
             idx = smallest;
         }
-        return HeapNode{top_p, top_pl.cost, top_pl.x, top_pl.y, top_pl.level, top_pl.hour};
+        return HeapNode{top_p, top_pl.cost, top_pl.state};
     }
+};
+
+// Всё крупное состояние поиска живёт в арене и переживает вызовы:
+//   * danger_grid / min_nb_danger / has_nb зависят только от карты и
+//     прогнозов, а не от старта/цели — считаются ОДИН раз и переиспользуются
+//     всеми сегментами маршрута (в питоне это пересчитывалось на каждый
+//     сегмент; значения идентичны, поэтому результат побитово тот же);
+//   * dist/aux/prev/visited/куча — переиспользуемые буферы: сброс значений
+//     дешевле, чем новые страницы у ОС на каждый сегмент.
+// Арена привязана к одному Environment (одному вызову calculate_path).
+struct StateAux { double stay, hour_stay, total_dist; };
+constexpr uint32_t NO_PREV = 0xFFFFFFFFu;
+
+struct DijkstraArena {
+    bool   ready = false;
+    size_t n4 = 0;
+    Buf<double>   danger_grid, min_nb_danger;
+    Buf<uint8_t>  has_nb;
+    Buf<double>   dist_grid;
+    Buf<StateAux> aux;
+    Buf<uint32_t> prev_state;
+    Buf<uint8_t>  visited;
+    Heap heap;
 };
 
 // =============================================================================
@@ -1170,7 +1220,8 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                                        double scale_x, double scale_y,
                                        int max_x3d, int max_y3d,
                                        int hour_lookahead, double hour_stay_distance,
-                                       double hour_switch_penalty) {
+                                       double hour_switch_penalty,
+                                       DijkstraArena& arena) {
     DijkstraRaw out;
 
     const int height = validity_cache.height;
@@ -1199,9 +1250,22 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
     const size_t BLOCK = (size_t)num_levels * max_hours;   // размер блока одной клетки
 
+    if (N4 > 0xFFFFFFFFull) {
+        // состояние должно помещаться в uint32 (куча и prev_state)
+        log_error("Search space exceeds 2^32 states");
+        out.ok = false;
+        return out;
+    }
+
+    const bool arena_fresh = !arena.ready || arena.n4 != N4;
+
+    Buf<double>&   danger_grid   = arena.danger_grid;
+    Buf<double>&   min_nb_danger = arena.min_nb_danger;
+    Buf<uint8_t>&  has_nb        = arena.has_nb;
+
+    if (arena_fresh) {
     // ---- precompute_danger_grid ----
-    Buf<double> danger_grid;
-    danger_grid.zeros(N4);   // calloc: нулевые страницы выдаются лениво, как в np.zeros
+    danger_grid.zeros(N4);   // mmap: нулевые страницы выдаются лениво, как в np.zeros
     // каждый поток пишет свои строки gy — гонок нет, результат не зависит от порядка
     parallel_for(0, (size_t)grid_h, [&](size_t gy_) {
         const int gy = (int)gy_;
@@ -1237,9 +1301,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     // посчитанная тем же выражением. Значит достаточно один раз запомнить
     // min(D_b) по соседям: 8 разбросанных чтений в самом горячем месте
     // превращаются в одно последовательное. Результат побитово тот же.
-    Buf<double> min_nb_danger;
     min_nb_danger.zeros(N4);
-    Buf<uint8_t> has_nb;
     has_nb.zeros((size_t)grid_h * grid_w);
 
     {
@@ -1274,35 +1336,44 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             }
         });
     }
+    }   // конец arena_fresh: danger_grid / min_nb_danger / has_nb готовы
 
     const double inf = 1e18;
 
     // dist_grid держим отдельно: он читается на КАЖДОЙ попытке релаксации,
-    // а три поля ниже — только на удачных и при извлечении узла. Слив их в
+    // а три поля aux — только на удачных и при извлечении узла. Слив их в
     // одну структуру, мы бы тянули 32 байта там, где нужно 8.
-    Buf<double> dist_grid; dist_grid.filled(N4, inf);
-
-    // Эти три всегда пишутся вместе и читаются вместе -> одна кэшлиния
-    // вместо трёх. Нули в StateAux — это нулевые биты, т.е. ровно 0.0.
-    struct StateAux { double stay, hour_stay, total_dist; };
-    Buf<StateAux> aux; aux.zeros(N4);
-
-    // Предок — это одно состояние из N4, а N4 помещается в uint32 даже на
-    // карте 20000x20000. Вместо четырёх int32 (gy, gx, level, hour) храним
-    // один плоский индекс: 16 байт на состояние -> 4.
-    constexpr uint32_t NO_PREV = 0xFFFFFFFFu;
-    Buf<uint32_t> prev_state; prev_state.filled(N4, NO_PREV);
-
-    Buf<uint8_t> visited; visited.zeros(N4);
+    Buf<double>&   dist_grid  = arena.dist_grid;
+    Buf<StateAux>& aux        = arena.aux;
+    Buf<uint32_t>& prev_state = arena.prev_state;
+    Buf<uint8_t>&  visited    = arena.visited;
+    Heap&          heap       = arena.heap;
 
     const long long max_heap_nodes = (long long)N4;
     const long long heap_capacity = std::min(max_nodes, max_heap_nodes) + 10;
-    Heap heap;
-    heap.init(heap_capacity);
+
+    if (arena_fresh) {
+        dist_grid.filled(N4, inf);
+        aux.zeros(N4);                    // нулевые биты == ровно 0.0
+        prev_state.filled(N4, NO_PREV);
+        visited.zeros(N4);
+        heap.init(heap_capacity);
+        arena.n4 = N4;
+        arena.ready = true;
+    } else {
+        // Повторный сегмент: буферы уже наши, сбрасываем значения на месте —
+        // это дешевле, чем каждый раз просить у ОС новые страницы и ловить
+        // page fault на первом касании каждых 4 КБ.
+        std::fill(dist_grid.data(), dist_grid.data() + N4, inf);
+        std::memset(aux.data(), 0, N4 * sizeof(StateAux));
+        std::memset(prev_state.data(), 0xFF, N4 * sizeof(uint32_t));   // == NO_PREV
+        std::memset(visited.data(), 0, N4);
+        heap.size = 0;
+    }
 
     const int start_hour = 0;
     dist_grid[IDX(start_gy, start_gx, start_level, start_hour)] = 0.0;
-    heap.push(0.0, 0.0, start_gx, start_gy, start_level, start_hour);
+    heap.push(0.0, 0.0, (uint32_t)IDX(start_gy, start_gx, start_level, start_hour));
 
     struct Dir { int dx, dy; double mul; };
     const double S2 = std::sqrt(2.0);
@@ -1318,9 +1389,16 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
     while (heap.size > 0 && nodes_processed < max_nodes) {
         const HeapNode top = heap.pop();
         const double cur_cost = top.cost;
-        const int32_t gx = top.x, gy = top.y, level = top.level, hour_idx = top.hour;
 
-        const size_t cur_ni = IDX(gy, gx, level, hour_idx);
+        // раскодируем плоский индекс (арифметика, обратная IDX)
+        const size_t cur_ni = (size_t)top.state;
+        const int hour_idx = (int)(cur_ni % (size_t)max_hours);
+        size_t rest = cur_ni / (size_t)max_hours;
+        const int level = (int)(rest % (size_t)num_levels);
+        rest /= (size_t)num_levels;
+        const int gx = (int)(rest % (size_t)grid_w);
+        const int gy = (int)(rest / (size_t)grid_w);
+
         if (visited[cur_ni]) continue;
         visited[cur_ni] = 1;
         nodes_processed++;
@@ -1391,10 +1469,17 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
             const double* __restrict dg_blk = danger_grid.data() + nblock;
             const double* __restrict mn_blk = min_nb_danger.data() + nblock;
 
-            for (int lvl_shift = -lookahead_levels; lvl_shift <= lookahead_levels; ++lvl_shift) {
+            // Границы цикла по эшелонам посчитаны заранее вместо continue на
+            // каждой итерации: выход за [0, num_levels) режется диапазоном,
+            // подъём при незакрытом stay режется верхней границей 0.
+            // Исполняются ровно те же итерации в том же порядке.
+            int lvl_lo = -lookahead_levels;
+            if (level + lvl_lo < 0) lvl_lo = -level;
+            int lvl_hi = (current_stay > 0.0) ? 0 : lookahead_levels;
+            if (level + lvl_hi >= num_levels) lvl_hi = num_levels - 1 - level;
+
+            for (int lvl_shift = lvl_lo; lvl_shift <= lvl_hi; ++lvl_shift) {
                 const int next_level = level + lvl_shift;
-                if (next_level < 0 || next_level >= num_levels) continue;
-                if (lvl_shift > 0 && current_stay > 0.0) continue;
 
                 double new_stay;
                 if (lvl_shift > 0)      new_stay = level_stay_multiplier * lvl_shift;
@@ -1416,12 +1501,24 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
                 if (base_hour < 0) base_hour = 0;
                 if (base_hour >= max_hours) base_hour = max_hours - 1;
 
-                for (int hour_shift = 0; hour_shift <= hour_lookahead; ++hour_shift) {
+                // Границы часового цикла тоже замкнуты аналитически:
+                //  * при hour_stay > 0 скачки вперёд (target > base) запрещены,
+                //    остаётся только hour_shift = 0 (для него target == base,
+                //    т.к. base уже приклампен к max_hours-1);
+                //  * при hour_stay == 0 итерации с target < hour_idx — пустые
+                //    continue, начинаем сразу с hour_idx - base_hour.
+                // Проверка target < hour_idx остаётся: она покрывает случай
+                // hour_stay > 0 && hour_idx > base_hour (ноль итераций).
+                const int hs_begin = (current_hour_stay > 0.0)
+                    ? 0
+                    : (hour_idx > base_hour ? hour_idx - base_hour : 0);
+                const int hs_end = (current_hour_stay > 0.0) ? 0 : hour_lookahead;
+
+                for (int hour_shift = hs_begin; hour_shift <= hs_end; ++hour_shift) {
                     int target_hour = base_hour + hour_shift;
                     if (target_hour >= max_hours) target_hour = max_hours - 1;
 
                     if (target_hour < hour_idx) continue;
-                    if (target_hour > base_hour && current_hour_stay > 0.0) continue;
 
                     double new_hour_stay;
                     if (target_hour > hour_idx) {
@@ -1480,7 +1577,7 @@ static DijkstraRaw dijkstra_numba_grid(double start_x, double start_y,
 
                         if (heap.size < heap.capacity)
                             heap.push(new_cost + heuristic * 0.1, new_cost,
-                                      ngx, ngy, next_level, target_hour);
+                                      (uint32_t)ni);
                     }
 
                     // Ранний выход, строго эквивалентный оригиналу.
@@ -2118,7 +2215,7 @@ static SegmentResult run_segment_pipeline(int segment_idx,
                                           double sx, double sy, double ex, double ey,
                                           Environment& env,
                                           int start_level_in, int end_level_in,
-                                          int hour_lookahead) {
+                                          int hour_lookahead, DijkstraArena& arena) {
     SegmentResult res;
 
     log_info("============================================================");
@@ -2160,7 +2257,7 @@ static SegmentResult run_segment_pipeline(int segment_idx,
         cfg::LENGTH_WEIGHT * cfg::DIJKSTRA_LENGTH_PENALTY,
         cfg::DIJKSTRA_GOAL_TOLERANCE, cfg::MAX_NODES,
         env.SCALE_X, env.SCALE_Y, env.MAX_X_3D, env.MAX_Y_3D,
-        hour_lookahead, cfg::HOUR_STAY_DISTANCE, cfg::HOUR_SWITCH_PENALTY);
+        hour_lookahead, cfg::HOUR_STAY_DISTANCE, cfg::HOUR_SWITCH_PENALTY, arena);
 
     if (!raw.ok || raw.px.empty()) {
         log_error("Numba kernel failed to build a path");
@@ -2561,12 +2658,15 @@ static std::vector<RouteRow> calculate_path(const std::vector<std::pair<double, 
 
     const int hour_lookahead = get_hour_lookahead_value((int)env->arrays_3d.size());
 
+    // одна арена на все сегменты: предрасчёты Дейкстры считаются один раз
+    DijkstraArena arena;
+
     std::vector<SegmentResult> segs;
     for (size_t i = 0; i + 1 < route_xy.size(); ++i) {
         SegmentResult sr = run_segment_pipeline((int)i + 1,
                                                 route_xy[i].first, route_xy[i].second,
                                                 route_xy[i + 1].first, route_xy[i + 1].second,
-                                                *env, -1, -1, hour_lookahead);
+                                                *env, -1, -1, hour_lookahead, arena);
         if (!sr.ok) {
             log_error("Segment " + std::to_string(i + 1) + " failed, route not built");
             return {};
@@ -2605,6 +2705,9 @@ int main(int argc, char** argv) {
         if (a.rfind("--threads=", 0) == 0) g_threads = (unsigned)std::atoi(a.c_str() + 10);
         else pos.push_back(a);
     }
+#ifdef _OPENMP
+    if (g_threads) omp_set_num_threads((int)g_threads);
+#endif
     if (pos.size() >= 4 && pos.size() % 2 == 0) {
         route_points.clear();
         for (size_t i = 0; i + 1 < pos.size(); i += 2)
