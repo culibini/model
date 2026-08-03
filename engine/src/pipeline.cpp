@@ -178,7 +178,17 @@ std::vector<RoutePoint> calculate_path(
         const Grid2D& danger_map,
         const std::vector<Array3D>& forecasts,
         const std::vector<std::pair<double, double>>& route_points_yx,
+        const std::vector<int>& route_levels,
         const Options& options) {
+
+    if (!route_levels.empty()) {
+        if (route_levels.size() != route_points_yx.size())
+            throw std::runtime_error(
+                "ValueError: route_levels must match route points count");
+        for (int lv : route_levels)
+            if (lv < 0 || lv >= cfg::NUM_LEVELS)
+                throw std::runtime_error("ValueError: level out of range 0..31");
+    }
 
     std::vector<std::pair<double, double>> route_xy;
     for (auto& p : route_points_yx) route_xy.emplace_back(p.second, p.first);
@@ -214,10 +224,14 @@ std::vector<RoutePoint> calculate_path(
     std::vector<SegmentResult> segs;
     int carry_level = -1;
     for (size_t i = 0; i + 1 < route_xy.size(); ++i) {
+        const int seg_start_level =
+            route_levels.empty() ? carry_level : route_levels[i];
+        const int seg_end_level =
+            route_levels.empty() ? -1 : route_levels[i + 1];
         SegmentResult sr = run_segment_pipeline(route_xy[i].first, route_xy[i].second,
                                                 route_xy[i + 1].first, route_xy[i + 1].second,
-                                                *env, carry_level, -1, hour_lookahead,
-                                                arena, rng, wastar);
+                                                *env, seg_start_level, seg_end_level,
+                                                hour_lookahead, arena, rng, wastar);
         if (!sr.ok) return {};
         carry_level = sr.goal_level_used;
         segs.push_back(std::move(sr));

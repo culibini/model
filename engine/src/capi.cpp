@@ -9,6 +9,7 @@ long long* engine_calculate_path(const double* danger_map, int map_h, int map_w,
                                 const double* forecasts, int n_hours,
                                 int f_levels, int f_h, int f_w,
                                 const double* points_yx, int n_points,
+                                const double* point_levels,
                                 double wastar, unsigned threads, unsigned seed,
                                 int* out_n) {
     *out_n = -1;
@@ -32,13 +33,18 @@ long long* engine_calculate_path(const double* danger_map, int map_h, int map_w,
         for (int i = 0; i < n_points; ++i)
             pts[i] = {points_yx[2 * i], points_yx[2 * i + 1]};
 
+        std::vector<int> levels;
+        if (point_levels)
+            for (int i = 0; i < n_points; ++i)
+                levels.push_back((int)point_levels[i]);
+
         engine::Options opt;
         opt.wastar = wastar;
         opt.threads = threads;
         opt.seed = (uint32_t)seed;
 
         const std::vector<engine::RoutePoint> route =
-            engine::calculate_path(map, fc, pts, opt);
+            engine::calculate_path(map, fc, pts, levels, opt);
 
         *out_n = (int)route.size();
         if (route.empty()) return nullptr;

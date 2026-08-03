@@ -18,6 +18,7 @@ def bind(lib):
         ctypes.POINTER(ctypes.c_double), ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_double), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
         ctypes.c_double, ctypes.c_uint, ctypes.c_uint,
         ctypes.POINTER(ctypes.c_int),
     ]
@@ -28,6 +29,7 @@ def bind(lib):
 def parse_args(argv):
     points = []
     wastar, threads, seed = 1.0, 0, 12345
+    levels = None
     plain = []
     for a in argv:
         if a.startswith("--wastar="):
@@ -36,19 +38,36 @@ def parse_args(argv):
             threads = int(a[10:])
         elif a.startswith("--seed="):
             seed = int(a[7:])
+        elif a.startswith("--levels="):
+            levels = [int(x) for x in a[9:].split(",")]
         else:
             plain.append(float(a))
     if len(plain) >= 4 and len(plain) % 2 == 0:
         points = [(plain[i], plain[i + 1]) for i in range(0, len(plain), 2)]
     else:
         points = [(2000.0, 8000.0), (3000.0, 3850.0), (1500.0, 1500.0)]
+    if levels is not None:
+        if len(levels) != len(points):
+            raise ValueError("--levels: число эшелонов должно совпадать с числом точек")
+        points = [(y, x, lv) for (y, x), lv in zip(points, levels)]
     return points, wastar, threads, seed
 
 
-def calculate(lib, danger_map, forecasts, points, wastar, threads, seed):
+def calculate(lib, danger_map, forecasts, points, wastar=1.0, threads=0, seed=12345):
+    sizes = {len(p) for p in points}
+    if sizes == {3}:
+        levels = np.ascontiguousarray([float(int(p[2])) for p in points], dtype=np.float64)
+    elif sizes == {2}:
+        levels = None
+    else:
+        raise ValueError("все точки должны быть (y, x) или (y, x, эшелон)")
+
     m = np.ascontiguousarray(danger_map, dtype=np.float64)
     f = np.ascontiguousarray(forecasts, dtype=np.float64)
-    p = np.ascontiguousarray(np.array(points, dtype=np.float64).reshape(-1))
+    p = np.ascontiguousarray(
+        np.array([[q[0], q[1]] for q in points], dtype=np.float64).reshape(-1))
+    lv_arg = (levels.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+              if levels is not None else None)
     out_n = ctypes.c_int(0)
     t0 = time.perf_counter()
     ptr = lib.engine_calculate_path(
@@ -56,6 +75,7 @@ def calculate(lib, danger_map, forecasts, points, wastar, threads, seed):
         f.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), f.shape[0],
         f.shape[1], f.shape[2], f.shape[3],
         p.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), len(points),
+        lv_arg,
         wastar, threads, seed, ctypes.byref(out_n),
     )
     dt = time.perf_counter() - t0
