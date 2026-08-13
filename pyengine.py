@@ -1475,7 +1475,8 @@ def main():
         fig.savefig("cpp_test.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
     except ImportError:
-        pass
+        print("matplotlib не установлен — cpp_test.png не сохранён "
+              "(pip install matplotlib)", file=sys.stderr)
 
 
 if __name__ == "__main__":
