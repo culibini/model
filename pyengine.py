@@ -14,8 +14,7 @@ SAFETY_WEIGHT_COEFF = 0.5
 BASE_PATH_LENGTH = 4000.0
 OPTIMIZATION_RADIUS = 400.0
 POINTS_TO_ADJUST = 5
-CANDIDATE_ANGLES = 16
-CANDIDATE_RADII = 3
+NUM_CANDIDATES = 60
 NUM_ITERATIONS = 3
 LEVEL_OPTIMIZATION_RANGE = 3
 LOOKAHEAD_LEVELS = 10
@@ -33,12 +32,68 @@ HOURS_PER_ARRAY_SLICE = 1.0
 HOUR_STAY_DISTANCE = FLIGHT_SPEED * 0.25
 HOUR_SWITCH_PENALTY = 25.0
 MAX_NODES = 35000000
+RNG_SEED = 12345
 
 LEVEL_PENALTIES = np.array([
     10, 10, 5, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
     10, 10, 20, 20, 30, 30, 40, 40, 50, 50,
     60, 60], dtype=np.float64)
+
+
+@njit(cache=True)
+def rk_next(mt, idx):
+    if idx[0] >= 624:
+        for i in range(624):
+            y = (mt[i] & np.uint32(0x80000000)) | (mt[(i + 1) % 624] & np.uint32(0x7FFFFFFF))
+            v = mt[(i + 397) % 624] ^ (y >> np.uint32(1))
+            if y & np.uint32(1):
+                v ^= np.uint32(0x9908B0DF)
+            mt[i] = v
+        idx[0] = 0
+    y = mt[idx[0]]
+    idx[0] += 1
+    y ^= y >> np.uint32(11)
+    y ^= (y << np.uint32(7)) & np.uint32(0x9D2C5680)
+    y ^= (y << np.uint32(15)) & np.uint32(0xEFC60000)
+    y ^= y >> np.uint32(18)
+    return y
+
+
+@njit(cache=True)
+def rng_seed(mt, idx, gauss, seed):
+    mt[0] = np.uint32(seed)
+    for i in range(1, 624):
+        mt[i] = np.uint32(np.uint32(1812433253) * (mt[i - 1] ^ (mt[i - 1] >> np.uint32(30))) + np.uint32(i))
+    idx[0] = 624
+    gauss[0] = 0.0
+    gauss[1] = 0.0
+
+
+@njit(cache=True)
+def rk_double(mt, idx):
+    a = np.float64(rk_next(mt, idx) >> np.uint32(5))
+    b = np.float64(rk_next(mt, idx) >> np.uint32(6))
+    return (a * 67108864.0 + b) / 9007199254740992.0
+
+
+@njit(cache=True)
+def rk_gauss(mt, idx, gauss):
+    if gauss[0] != 0.0:
+        t = gauss[1]
+        gauss[0] = 0.0
+        gauss[1] = 0.0
+        return t
+    while True:
+        x1 = 2.0 * rk_double(mt, idx) - 1.0
+        x2 = 2.0 * rk_double(mt, idx) - 1.0
+        r2 = x1 * x1 + x2 * x2
+        if r2 < 1.0 and r2 != 0.0:
+            break
+    f = np.sqrt(-2.0 * np.log(r2) / r2)
+    gauss[0] = 1.0
+    gauss[1] = f * x1
+    return f * x2
 
 
 @njit(cache=True)
@@ -183,28 +238,32 @@ def is_point_and_neighbors_safe(path_xs, path_ys, center_index, px, py, w, h):
 
 
 @njit(cache=True)
-def generate_candidates(cx0, cy0, radius, width, height,
-                        use_direction, ideal_x, ideal_y):
-    total = CANDIDATE_ANGLES * CANDIDATE_RADII + 1
-    out_x = np.empty(total, dtype=np.float64)
-    out_y = np.empty(total, dtype=np.float64)
+def generate_candidates(cx0, cy0, num_candidates, max_attempts, radius, width, height,
+                        use_direction, dir_x, dir_y, mt, idx, gauss):
+    out_x = np.empty(num_candidates, dtype=np.float64)
+    out_y = np.empty(num_candidates, dtype=np.float64)
     count = 0
-    for a in range(CANDIDATE_ANGLES):
-        angle = 2.0 * np.pi * np.float64(a) / np.float64(CANDIDATE_ANGLES)
-        ca = np.cos(angle)
-        sa = np.sin(angle)
-        for rj in range(CANDIDATE_RADII):
-            r = radius * np.float64(rj + 1) / np.float64(CANDIDATE_RADII)
-            cx = cx0 + r * ca
-            cy = cy0 + r * sa
-            cx = max(0.0, min(width - 1.0, cx))
-            cy = max(0.0, min(height - 1.0, cy))
-            out_x[count] = cx
-            out_y[count] = cy
-            count += 1
-    if use_direction:
-        cx = max(0.0, min(width - 1.0, ideal_x))
-        cy = max(0.0, min(height - 1.0, ideal_y))
+    attempts = 0
+    while count < num_candidates and attempts < max_attempts:
+        attempts += 1
+        take_dir = False
+        if use_direction:
+            if rk_double(mt, idx) < 0.7:
+                take_dir = True
+        if take_dir:
+            angle_variation = 0.0 + 0.5 * rk_gauss(mt, idx, gauss)
+            base_angle = np.arctan2(dir_y, dir_x)
+            angle = base_angle + angle_variation
+            r = rk_double(mt, idx) * radius
+        else:
+            angle = rk_double(mt, idx) * 2.0 * np.pi
+            r = rk_double(mt, idx) * radius
+        dx = r * np.cos(angle)
+        dy = r * np.sin(angle)
+        cx = cx0 + dx
+        cy = cy0 + dy
+        cx = max(0.0, min(width - 1.0, cx))
+        cy = max(0.0, min(height - 1.0, cy))
         out_x[count] = cx
         out_y[count] = cy
         count += 1
@@ -1090,7 +1149,7 @@ def refine_path(px, py, lvl, stay, tdist, arr, frozen, arrays_count,
 
 
 def optimize_stage2(xs, ys, levels, stay, total, arrs, frozen, w_safety, w_length,
-                    danger2d, fc4, scale_x, scale_y,
+                    danger2d, fc4, scale_x, scale_y, mt, ridx, gauss,
                     dk_dang, dk_hour, order, ostate):
     n_points = len(xs)
     path_xs = np.array(xs, dtype=np.float64)
@@ -1119,10 +1178,6 @@ def optimize_stage2(xs, ys, levels, stay, total, arrs, frozen, w_safety, w_lengt
     best_lv = path_levels.copy()
 
     for _ in range(NUM_ITERATIONS):
-        pass_xs = path_xs.copy()
-        pass_ys = path_ys.copy()
-        pass_lv = path_levels.copy()
-
         for i in range(1, n_points - 1):
             if frozen[i]:
                 continue
@@ -1137,18 +1192,22 @@ def optimize_stage2(xs, ys, levels, stay, total, arrs, frozen, w_safety, w_lengt
             best_cx, best_cy, best_level = cur_x, cur_y, current_level
 
             use_direction = False
-            ideal_x = ideal_y = 0.0
+            dir_x = dir_y = 0.0
             if 0 < i < n_points - 1:
                 ideal_x = (path_xs[i - 1] + path_xs[i + 1]) / 2.0
                 ideal_y = (path_ys[i - 1] + path_ys[i + 1]) / 2.0
                 ddx = ideal_x - cur_x
                 ddy = ideal_y - cur_y
-                if ddx * ddx + ddy * ddy > 0.0:
+                dist_to_ideal = float(np.sqrt(ddx * ddx + ddy * ddy))
+                if dist_to_ideal > 0.0:
+                    dir_x = ddx / dist_to_ideal
+                    dir_y = ddy / dist_to_ideal
                     use_direction = True
 
             gx_arr, gy_arr = generate_candidates(
-                cur_x, cur_y, OPTIMIZATION_RADIUS, float(w2), float(h2),
-                use_direction, ideal_x, ideal_y)
+                cur_x, cur_y, NUM_CANDIDATES, NUM_CANDIDATES * 10,
+                OPTIMIZATION_RADIUS, float(w2), float(h2),
+                use_direction, dir_x, dir_y, mt, ridx, gauss)
 
             cand_x = []
             cand_y = []
@@ -1209,14 +1268,10 @@ def optimize_stage2(xs, ys, levels, stay, total, arrs, frozen, w_safety, w_lengt
             best_td = path_total.copy()
             best_lv = path_levels.copy()
 
-        if (np.array_equal(pass_xs, path_xs) and np.array_equal(pass_ys, path_ys)
-                and np.array_equal(pass_lv, path_levels)):
-            break
-
     return best_xs, best_ys, best_lv, best_td
 
 
-def calculate(danger_map, forecasts, points, wastar=1.0, threads=0):
+def calculate(danger_map, forecasts, points, wastar=1.0, threads=0, seed=RNG_SEED):
     sizes = {len(p) for p in points}
     if sizes == {3}:
         route_levels = [int(p[2]) for p in points]
@@ -1251,6 +1306,11 @@ def calculate(danger_map, forecasts, points, wastar=1.0, threads=0):
             raise RuntimeError(
                 "ValueError: Route point %d (%.1f, %.1f) is out of bounds for map %dx%d"
                 % (idx0 + 1, x, y, width, height))
+
+    mt = np.zeros(624, dtype=np.uint32)
+    ridx = np.zeros(1, dtype=np.int64)
+    gauss = np.zeros(2, dtype=np.float64)
+    rng_seed(mt, ridx, gauss, seed)
 
     dk_dang = Dict.empty(types.uint64, types.float64)
     dk_hour = Dict.empty(types.uint64, types.int64)
@@ -1328,7 +1388,7 @@ def calculate(danger_map, forecasts, points, wastar=1.0, threads=0):
 
         oxs, oys, olv, otd = optimize_stage2(
             rx, ry, rl, rs, rt, ra, rf, safety, LENGTH_WEIGHT,
-            danger2d, fc4, scale_x, scale_y,
+            danger2d, fc4, scale_x, scale_y, mt, ridx, gauss,
             dk_dang, dk_hour, order, ostate)
 
         seg_results.append((list(rx), list(ry), [int(v) for v in rl],
@@ -1363,7 +1423,7 @@ def calculate(danger_map, forecasts, points, wastar=1.0, threads=0):
 
 def main():
     args = sys.argv[1:]
-    wastar, threads = 1.0, 0
+    wastar, threads, seed = 1.0, 0, RNG_SEED
     levels = None
     plain = []
     for a in args:
@@ -1371,6 +1431,8 @@ def main():
             wastar = float(a[9:])
         elif a.startswith("--threads="):
             threads = int(a[10:])
+        elif a.startswith("--seed="):
+            seed = int(a[7:])
         elif a.startswith("--levels="):
             levels = [int(x) for x in a[9:].split(",")]
         else:
@@ -1391,7 +1453,7 @@ def main():
                           for h in range(10)])
 
     t0 = time.perf_counter()
-    route = calculate(danger_map, forecasts, points, wastar, threads)
+    route = calculate(danger_map, forecasts, points, wastar, threads, seed)
     dt = time.perf_counter() - t0
 
     print(f"Время выполнения: {dt:.6f} c")
