@@ -13,10 +13,10 @@ const STEP = 500;
 
 const GLASS = {
   svg: [[16.279, 15.385], [83.721, 15.385], [87.209, 56.923], [12.791, 56.923]],
-  photo: [[30.5, 17.6], [72.2, 17.6], [74.2, 36.8], [28.2, 36.8]]
+  photo: [[31.658, 15.941], [68.342, 15.941], [73.549, 34.007], [26.451, 34.007]]
 };
-const ZOOM_FILL_X = 0.88;
-const ZOOM_FILL_Y = 0.72;
+const ZOOM_FILL_X = 0.9;
+const ZOOM_FILL_Y = 0.74;
 const SWATCHES = ['transparent', '#c9f24a', '#4aa8f2', '#ffffff', '#ff6b6b', '#111418'];
 
 const state = {
@@ -107,12 +107,18 @@ function layoutGlass() {
 function setZoom(on) {
   zoomed = on;
   const box = glassBox();
-  if (on) {
-    const k = Math.min(ZOOM_FILL_X / (box.width / 100), ZOOM_FILL_Y / (box.height / 100));
-    const cx = box.left + box.width / 2;
-    const cy = box.top + box.height / 2;
-    el.shotZoom.style.transform = `translate(${(50 - k * cx).toFixed(3)}%, ${(50 - k * cy).toFixed(3)}%) scale(${k.toFixed(3)})`;
+  const w = el.shotZoom.offsetWidth;
+  const h = el.shotZoom.offsetHeight;
+
+  if (on && w && h) {
+    const k = ZOOM_FILL_X / (box.width / 100);
+    const frame = Math.min(h, Math.max(190, (k * box.height / 100 * h) / ZOOM_FILL_Y));
+    const tx = w / 2 - k * (box.left + box.width / 2) / 100 * w;
+    const ty = frame / 2 - k * (box.top + box.height / 2) / 100 * h;
+    el.shot.style.height = frame.toFixed(1) + 'px';
+    el.shotZoom.style.transform = `translate(${tx.toFixed(2)}px, ${ty.toFixed(2)}px) scale(${k.toFixed(4)})`;
   } else {
+    el.shot.style.height = '';
     el.shotZoom.style.transform = 'none';
   }
   el.shot.classList.toggle('is-zoomed', on);
@@ -120,17 +126,21 @@ function setZoom(on) {
   el.status.textContent = on ? 'Крупный план · заднее стекло' : 'Общий вид · Tiguan II 2020';
 }
 
+function usePhoto() {
+  if (!el.photo || !el.photo.naturalWidth) return;
+  el.shot.classList.add('is-photo');
+  quad = GLASS.photo;
+  layoutGlass();
+  if (zoomed) setZoom(true);
+}
+
 function initShot() {
-  el.photo.addEventListener('load', () => {
-    if (!el.photo.naturalWidth) return;
-    el.shot.classList.add('is-photo');
-    quad = GLASS.photo;
-    layoutGlass();
-    if (zoomed) setZoom(true);
-  });
+  el.photo.addEventListener('load', usePhoto);
   el.photo.addEventListener('error', () => el.photo.remove());
+  if (el.photo.complete) usePhoto();
 
   el.hit.addEventListener('click', () => setZoom(true));
+  window.addEventListener('resize', () => requestAnimationFrame(() => setZoom(zoomed)));
   el.zoomOut.addEventListener('click', () => setZoom(false));
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && zoomed) setZoom(false);
@@ -161,46 +171,53 @@ function preset(kind) {
   return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
 }
 
+function lotNode(lot) {
+  const data = item(lot.id);
+  const node = document.createElement('button');
+  node.type = 'button';
+  node.className = 'lot';
+  node.dataset.id = lot.id;
+  node.setAttribute('aria-label', `${tag(lot)} — ${lot.name}`);
+  if (state.mode === 'full') node.classList.add('is-full');
+  if (state.selected === lot.id) node.classList.add('is-selected');
+  if (lot.owner === 'вы') node.classList.add('is-mine');
+  if (lot.owner) node.classList.add('is-taken');
+  if (data.bg !== 'transparent') node.style.background = data.bg;
+
+  if (data.src) {
+    node.classList.add('has-media');
+    const img = document.createElement('img');
+    img.className = 'lot__img';
+    img.src = data.src;
+    img.alt = '';
+    img.style.transform = `scale(${data.scale / 100})`;
+    node.appendChild(img);
+  }
+  if (data.caption) {
+    const cap = document.createElement('span');
+    cap.className = 'lot__caption';
+    cap.textContent = data.caption;
+    node.appendChild(cap);
+  }
+
+  const label = document.createElement('span');
+  label.className = 'lot__label';
+  label.innerHTML = `<span>${tag(lot)}</span><span>${money(lot.bid)}</span>`;
+  node.appendChild(label);
+  node.addEventListener('click', () => select(lot.id));
+  return node;
+}
+
 function renderLots() {
-  const lots = activeLots();
   el.grid.classList.toggle('is-full', state.mode === 'full');
   el.grid.innerHTML = '';
 
-  lots.forEach(lot => {
-    const data = item(lot.id);
-    const node = document.createElement('button');
-    node.type = 'button';
-    node.className = 'lot';
-    node.dataset.id = lot.id;
-    node.setAttribute('aria-label', `${lot.id} — ${lot.name}`);
-    if (state.mode === 'full') node.classList.add('is-full');
-    if (state.selected === lot.id) node.classList.add('is-selected');
-    if (lot.owner === 'вы') node.classList.add('is-mine');
-    if (lot.owner) node.classList.add('is-taken');
-    if (data.bg !== 'transparent') node.style.background = data.bg;
-
-    if (data.src) {
-      const img = document.createElement('img');
-      img.className = 'lot__img';
-      img.src = data.src;
-      img.alt = '';
-      img.style.transform = `scale(${data.scale / 100})`;
-      node.appendChild(img);
-    }
-    if (data.caption) {
-      const cap = document.createElement('span');
-      cap.className = 'lot__caption';
-      cap.textContent = data.caption;
-      node.appendChild(cap);
-    }
-
-    const label = document.createElement('span');
-    label.className = 'lot__label';
-    label.innerHTML = `<span>${tag(lot)}</span><span>${money(lot.bid)}</span>`;
-    node.appendChild(label);
-
-    node.addEventListener('click', () => select(lot.id));
-    el.grid.appendChild(node);
+  const rows = state.mode === 'full' ? [[FULL]] : [LOTS.slice(0, 3), LOTS.slice(3)];
+  rows.forEach((lots, i) => {
+    const row = document.createElement('div');
+    row.className = i === 0 && state.mode !== 'full' ? 'lots__row lots__row--top' : 'lots__row';
+    lots.forEach(lot => row.appendChild(lotNode(lot)));
+    el.grid.appendChild(row);
   });
 }
 
