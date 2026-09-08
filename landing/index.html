@@ -76,8 +76,13 @@
 
     <div class="builder__grid">
       <div class="stage" id="stage">
-        <div class="stage__hint">Перетащите изображение на стекло</div>
-        <figure class="car" id="car">
+        <div class="stage__top">
+          <span class="stage__status" id="stageStatus">Общий вид · Tiguan II 2020</span>
+          <button class="stage__back" id="zoomOut" type="button" hidden>← Общий вид</button>
+        </div>
+        <figure class="shot" id="shot">
+          <div class="shot__zoom" id="shotZoom">
+            <img class="shot__photo" id="carPhoto" src="assets/car-rear.png" alt="Задняя часть Volkswagen Tiguan II 2020" hidden>
           <svg class="car__svg" viewBox="170 50 860 650" role="img" aria-label="Задняя часть Volkswagen Tiguan II 2020">
             <defs>
               <linearGradient id="paint" x1="0" y1="0" x2="0" y2="1">
@@ -390,10 +395,13 @@
             <rect x="170" y="50" width="860" height="650" fill="url(#vignette)"/>
           </svg>
 
-          <div class="glass" id="glass">
-            <div class="lots" id="lotsGrid"></div>
-            <div class="glass__sheen" aria-hidden="true"></div>
+            <div class="glass" id="glass">
+              <div class="lots" id="lotsGrid"></div>
+              <div class="glass__sheen" aria-hidden="true"></div>
+            </div>
           </div>
+          <button class="shot__hit" id="glassHit" type="button" aria-label="Приблизить заднее стекло"></button>
+          <span class="shot__hint" id="shotHint">Нажмите на стекло</span>
         </figure>
 
         <div class="stage__legend">

@@ -10,6 +10,13 @@ const LOTS = [
 const FULL = { id: 'FULL', short: 'ВСЁ', name: 'Всё стекло целиком', size: '130 × 55 см', base: 39000, bid: 42000, owner: 'dostavka_v_ryadom' };
 
 const STEP = 500;
+
+const GLASS = {
+  svg: [[16.279, 15.385], [83.721, 15.385], [87.209, 56.923], [12.791, 56.923]],
+  photo: [[30.5, 17.6], [72.2, 17.6], [74.2, 36.8], [28.2, 36.8]]
+};
+const ZOOM_FILL_X = 0.88;
+const ZOOM_FILL_Y = 0.72;
 const SWATCHES = ['transparent', '#c9f24a', '#4aa8f2', '#ffffff', '#ff6b6b', '#111418'];
 
 const state = {
@@ -25,6 +32,14 @@ const tag = lot => lot.short || lot.id;
 const activeLots = () => (state.mode === 'full' ? [FULL] : LOTS);
 
 const el = {
+  shot: document.getElementById('shot'),
+  shotZoom: document.getElementById('shotZoom'),
+  photo: document.getElementById('carPhoto'),
+  glass: document.getElementById('glass'),
+  hit: document.getElementById('glassHit'),
+  hint: document.getElementById('shotHint'),
+  status: document.getElementById('stageStatus'),
+  zoomOut: document.getElementById('zoomOut'),
   grid: document.getElementById('lotsGrid'),
   lotsBox: document.getElementById('lotsGrid'),
   stage: document.getElementById('stage'),
@@ -56,6 +71,72 @@ const el = {
   formOk: document.getElementById('formOk'),
   year: document.getElementById('year')
 };
+
+let quad = GLASS.svg;
+let zoomed = false;
+
+function glassBox() {
+  const xs = quad.map(p => p[0]);
+  const ys = quad.map(p => p[1]);
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
+  return { left, top, width: Math.max(...xs) - left, height: Math.max(...ys) - top };
+}
+
+function layoutGlass() {
+  const box = glassBox();
+  const points = quad
+    .map(([x, y]) => `${((x - box.left) / box.width * 100).toFixed(3)}% ${((y - box.top) / box.height * 100).toFixed(3)}%`)
+    .join(',');
+
+  Object.assign(el.glass.style, {
+    left: box.left + '%',
+    top: box.top + '%',
+    width: box.width + '%',
+    height: box.height + '%',
+    clipPath: `polygon(${points})`
+  });
+  Object.assign(el.hit.style, {
+    left: box.left + '%',
+    top: box.top + '%',
+    width: box.width + '%',
+    height: box.height + '%'
+  });
+}
+
+function setZoom(on) {
+  zoomed = on;
+  const box = glassBox();
+  if (on) {
+    const k = Math.min(ZOOM_FILL_X / (box.width / 100), ZOOM_FILL_Y / (box.height / 100));
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    el.shotZoom.style.transform = `translate(${(50 - k * cx).toFixed(3)}%, ${(50 - k * cy).toFixed(3)}%) scale(${k.toFixed(3)})`;
+  } else {
+    el.shotZoom.style.transform = 'none';
+  }
+  el.shot.classList.toggle('is-zoomed', on);
+  el.zoomOut.hidden = !on;
+  el.status.textContent = on ? 'Крупный план · заднее стекло' : 'Общий вид · Tiguan II 2020';
+}
+
+function initShot() {
+  el.photo.addEventListener('load', () => {
+    if (!el.photo.naturalWidth) return;
+    el.shot.classList.add('is-photo');
+    quad = GLASS.photo;
+    layoutGlass();
+    if (zoomed) setZoom(true);
+  });
+  el.photo.addEventListener('error', () => el.photo.remove());
+
+  el.hit.addEventListener('click', () => setZoom(true));
+  el.zoomOut.addEventListener('click', () => setZoom(false));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && zoomed) setZoom(false);
+  });
+  layoutGlass();
+}
 
 function item(id) {
   if (!state.items[id]) state.items[id] = { src: null, caption: '', scale: 100, bg: 'transparent' };
@@ -191,6 +272,7 @@ function render() {
 function select(id) {
   state.selected = id;
   render();
+  if (!zoomed) setZoom(true);
 }
 
 function setMode(mode) {
@@ -405,6 +487,7 @@ function initForm() {
   });
 }
 
+initShot();
 initSwatches();
 initBuilderEvents();
 initTimer();
