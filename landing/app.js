@@ -63,12 +63,20 @@ function item(id) {
 }
 
 function preset(kind) {
-  const shapes = {
-    logo: `<circle cx="200" cy="112" r="52" fill="#c9f24a"/><text x="200" y="128" text-anchor="middle" font-size="52" font-weight="800" fill="#0d1206" font-family="Manrope,sans-serif">B</text>`,
-    promo: `<rect x="70" y="66" width="260" height="92" rx="18" fill="#c9f24a"/><text x="200" y="128" text-anchor="middle" font-size="46" font-weight="800" fill="#0d1206" font-family="Manrope,sans-serif">−20%</text>`,
-    qr: `<g fill="#ffffff"><rect x="140" y="52" width="120" height="120" rx="8"/></g><g fill="#0d1117"><rect x="152" y="64" width="28" height="28"/><rect x="220" y="64" width="28" height="28"/><rect x="152" y="132" width="28" height="28"/><rect x="192" y="104" width="16" height="16"/><rect x="220" y="120" width="16" height="16"/><rect x="236" y="146" width="14" height="14"/><rect x="192" y="146" width="14" height="14"/></g>`
+  const art = {
+    logo: `<rect width="400" height="250" fill="#11151b"/><circle cx="200" cy="104" r="46" fill="#c9f24a"/>
+      <text x="200" y="120" text-anchor="middle" font-size="46" font-weight="800" fill="#11151b" font-family="Manrope,sans-serif">B</text>
+      <text x="200" y="192" text-anchor="middle" font-size="30" font-weight="800" letter-spacing="6" fill="#ffffff" font-family="Manrope,sans-serif">BRAND</text>`,
+    promo: `<rect width="400" height="250" fill="#c9f24a"/>
+      <text x="200" y="128" text-anchor="middle" font-size="86" font-weight="800" fill="#11151b" font-family="Manrope,sans-serif">-20%</text>
+      <text x="200" y="176" text-anchor="middle" font-size="24" font-weight="700" letter-spacing="3" fill="#2c3a08" font-family="Manrope,sans-serif">ПО ПРОМОКОДУ</text>`,
+    qr: `<rect width="400" height="250" fill="#ffffff"/>
+      <g fill="#11151b"><rect x="146" y="26" width="108" height="108" rx="6" fill="none" stroke="#11151b" stroke-width="8"/>
+      <rect x="158" y="38" width="26" height="26"/><rect x="216" y="38" width="26" height="26"/><rect x="158" y="96" width="26" height="26"/>
+      <rect x="196" y="70" width="16" height="16"/><rect x="222" y="82" width="16" height="16"/><rect x="238" y="108" width="14" height="14"/><rect x="196" y="108" width="14" height="14"/></g>
+      <text x="200" y="196" text-anchor="middle" font-size="28" font-weight="800" letter-spacing="2" fill="#11151b" font-family="Manrope,sans-serif">СКАНИРУЙ</text>`
   };
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 250"><rect width="400" height="250" fill="#101620"/>${shapes[kind]}</svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="250" viewBox="0 0 400 250">${art[kind]}</svg>`;
   return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
 }
 
